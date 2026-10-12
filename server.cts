@@ -32,12 +32,13 @@ type RuntimeConfig = Record<string, string>;
 const ROOT = __dirname;
 const DIST = path.join(ROOT, 'dist');
 
-// VISTA 3D 에셋(624MB, 57 GLB)은 리포에 복사하지 않고 원본 위치를 정적 마운트한다.
+// VISTA 3D 에셋(322MB, 56 GLB)은 VISTA client/public/3d-bundles 에서 js/vendor/3d-bundles 로 벤더링했다.
 // 벤더링한 placementRuntimeAssets.ts의 resolveTerrainRuntimePublicPath()가
 // import.meta.url 기준 `../3d-bundles/...` 로 해석하므로 마운트 지점은 /js/vendor/3d-bundles.
+// VISTA 원본을 직접 쓰려면 VISTA_BUNDLES_DIR 로 덮어쓴다.
 const VISTA_BUNDLES_URL = '/js/vendor/3d-bundles/';
 const VISTA_BUNDLES_DIR = process.env.VISTA_BUNDLES_DIR
-  || 'C:/Users/USER/Desktop/VISTA/client/public/3d-bundles';
+  || path.join(ROOT, 'js', 'vendor', '3d-bundles');
 
 // Only these repository directories are public runtime assets.  In particular,
 // do not fall back to ROOT for arbitrary paths: that would expose .env, .git,

@@ -18,13 +18,18 @@ const root = path.resolve(here, '..');
 const scaffoldaDir = process.env.SCAFFOLDA_DIR
   || path.resolve(root, '../../Scaffolda-public');
 
+const outfile = path.join(root, 'js/vendor/scaffolda/scaffolda.bundle.js');
+
 if (!fs.existsSync(path.join(scaffoldaDir, 'src/features/scaffolda/lib/earthworkModel.ts'))) {
+  // 저장소만 받은 환경: 커밋된 번들을 그대로 쓴다. 원본을 고쳐 다시 묶을 때만 원본이 필요하다.
+  if (fs.existsSync(outfile)) {
+    console.log(`Scaffolda 원본 없음(${scaffoldaDir}) — 커밋된 번들을 그대로 사용합니다.`);
+    process.exit(0);
+  }
   console.error(`Scaffolda 원본을 찾을 수 없습니다: ${scaffoldaDir}`);
   console.error('SCAFFOLDA_DIR 환경변수로 경로를 지정하세요.');
   process.exit(1);
 }
-
-const outfile = path.join(root, 'js/vendor/scaffolda/scaffolda.bundle.js');
 
 const result = await build({
   entryPoints: [path.join(root, 'js/vendor/scaffolda/entry.ts')],

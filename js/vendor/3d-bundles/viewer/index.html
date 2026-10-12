@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <title>VISTA 3D Viewer</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="viewport"></div>
+      <div id="status">3D 모델을 불러오는 중입니다.</div>
+      <div id="action-panel" hidden>
+        <div id="action-eyebrow">LIVE ACTION</div>
+        <div id="action-mode"></div>
+        <div id="action-state"></div>
+        <div id="action-counts"></div>
+      </div>
+      <div id="title-block">
+        <div id="asset-name"></div>
+        <div id="model-name"></div>
+      </div>
+      <div id="lineup-panel" hidden>
+        <div id="lineup-title"></div>
+        <div id="lineup-summary"></div>
+        <div id="lineup-items"></div>
+      </div>
+      <div id="hint">Drag to rotate, wheel to zoom</div>
+    </div>
+    <script type="module" src="./viewer.js"></script>
+  </body>
+</html>

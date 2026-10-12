@@ -70,11 +70,10 @@ cp .env.example .env   # VWORLD_API_KEY 등 실제 키 입력 (아래 "API 연�
 `data/vworld-cache/`)에 쌓습니다. 그래서 **반드시 서버를 띄워서** 접속해야 합니다.
 
 ```bash
-# 클론 직후 최소 실행 (외부 원본 소스 없이)
+# 클론 직후 (Node.js 24 기준으로 검증 · Windows cmd 는 cp 대신 copy)
 npm install
 cp .env.example .env        # 위 표의 키 입력
-npm run build:web           # src → dist/ (번들은 저장소에 포함돼 있어 재빌드 불필요)
-npm run dev:server          # → http://localhost:8917
+npm start                   # 빌드 + 서버 → http://localhost:8917
 ```
 
 연결 확인: `http://localhost:8917/api/health` 의 `checks`에서 `vworld`·`maptiler`가
@@ -82,15 +81,14 @@ npm run dev:server          # → http://localhost:8917
 `GP_OFFLINE_TILES=1`로 두면 인터넷 없이 캐시만으로 띄울 수 있습니다(`npm run seed:offline`으로 미리 채움).
 
 참고:
-- `npm start`/`npm run build`는 `build:scaffolda`가 저장소 밖 `../../Scaffolda-public` 원본
-  (또는 `SCAFFOLDA_DIR`)을 요구합니다. 원본이 없으면 위처럼 `build:web`만 쓰세요.
+- `npm start`/`npm run build`는 그대로 동작합니다. Scaffolda·KAIROS 번들은 저장소에 포함돼 있어,
+  저장소 밖 Scaffolda 원본(`../../Scaffolda-public` 또는 `SCAFFOLDA_DIR`)이 없으면 커밋된 번들을 씁니다.
 - GitHub Pages 같은 정적 호스팅으로는 띄울 수 없습니다 — 키 주입·CORS 프록시를 서버가 맡기 때문이며,
   키를 프런트 코드에 박으면 공개 저장소에서 그대로 노출됩니다.
 - VWorld 데이터 API가 `INCORRECT_KEY`를 돌려주면 키 오류가 아니라 호출 한도 초과입니다(아래 「외부 실데이터」).
-- 전차·항공기·포병 등 무기체계 모델과 폭발 이펙트는 VISTA 프로젝트의 `client/public/3d-bundles`(약 330MB)를
-  저장소에 복사하지 않고 서버가 `/js/vendor/3d-bundles/`로 마운트합니다. 그 폴더가 있으면 서버를 띄울 때 환경변수로
-  `VISTA_BUNDLES_DIR=<경로>/VISTA/client/public/3d-bundles`를 지정하세요(`/api/health`의 `vistaBundles`). 없어도
-  지도·지형·배치 시설은 보이고, 해당 무기 모델·이펙트만 빠집니다.
+- 전차·항공기·포병 등 무기체계 모델과 폭발 이펙트(VISTA `client/public/3d-bundles`, 322MB)는
+  `js/vendor/3d-bundles/`에 포함돼 있어 따로 받을 것이 없습니다. VISTA 원본 폴더를 직접 쓰려면
+  서버를 띄울 때 환경변수 `VISTA_BUNDLES_DIR`로 경로를 바꿉니다.
 - 용량 문제로 런타임에 쓰지 않는 원본(`assets/models/*_raw.glb`, `assets/models/usd/`)과 Blender 지형 빌드 캐시
   (`data/blender_cache/`의 타일·중간 산출물 — 스크립트만 포함)는 저장소에서 뺐습니다. 완성된 지형 GLB는 `assets/models/`에 있습니다.
 
@@ -252,7 +250,7 @@ DELETE /api/plans/:planId
 커밋하지 않는다. 현재 API에는 인증이 없으므로 localhost 독립 실행 범위에서만
 사용하고, 외부 공개 전에는 기존 인증/RBAC 게이트 뒤에 배치해야 한다.
 
-VISTA 3D 에셋(624MB, GLB 57개)은 리포에 복사하지 않고 `server.cts`가 원본 위치를
+VISTA 3D 에셋(322MB, GLB 56개)은 `js/vendor/3d-bundles/`에 벤더링했고 `server.cts`가
 `/js/vendor/3d-bundles/` 로 정적 마운트한다. 경로는 `VISTA_BUNDLES_DIR` 로 덮어쓸 수 있다.
 딥링크: `?demo=fpv`(1인칭) · `?demo=infil`(침투 리허설) · `?demo=ipb`(NAI/DP/TAI 자동 도출)
 

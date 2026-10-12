@@ -1,0 +1,234 @@
+:root {
+  --accent: #9ccf7a;
+  --glow: #dcedb4;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: Bahnschrift, "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at top, rgba(115, 153, 86, 0.18), transparent 28%),
+    linear-gradient(180deg, #0f1710 0%, #081008 52%, #040704 100%);
+  color: #eef7ff;
+}
+
+#app {
+  position: relative;
+}
+
+#viewport {
+  position: absolute;
+  inset: 0;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+#status,
+#action-panel,
+#title-block,
+#lineup-panel,
+#hint {
+  position: absolute;
+  z-index: 1;
+  backdrop-filter: blur(10px);
+  background: rgba(7, 12, 12, 0.58);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #eef7ff;
+}
+
+#status {
+  top: 14px;
+  left: 14px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+
+#action-panel {
+  left: 14px;
+  bottom: 14px;
+  max-width: min(320px, calc(100% - 28px));
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: linear-gradient(
+    180deg,
+    rgba(7, 12, 12, 0.68),
+    rgba(7, 12, 12, 0.54)
+  );
+  border-color: color-mix(in srgb, var(--glow) 28%, rgba(255, 255, 255, 0.12));
+}
+
+#action-eyebrow {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: color-mix(in srgb, var(--glow) 74%, white 26%);
+}
+
+#action-mode {
+  margin-top: 5px;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+#action-state {
+  margin-top: 6px;
+  font-size: 12px;
+  color: rgba(238, 247, 255, 0.82);
+}
+
+#action-counts {
+  margin-top: 8px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: rgba(238, 247, 255, 0.72);
+}
+
+#title-block {
+  right: 14px;
+  top: 14px;
+  max-width: min(320px, calc(100% - 28px));
+  padding: 10px 12px;
+  border-radius: 12px;
+  text-align: right;
+}
+
+#lineup-panel {
+  left: 14px;
+  top: 68px;
+  width: min(360px, calc(100% - 28px));
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: linear-gradient(
+    180deg,
+    rgba(7, 12, 12, 0.72),
+    rgba(7, 12, 12, 0.52)
+  );
+  border-color: color-mix(
+    in srgb,
+    var(--accent) 24%,
+    rgba(255, 255, 255, 0.12)
+  );
+}
+
+#asset-name {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: color-mix(in srgb, var(--glow) 72%, white 28%);
+}
+
+#model-name {
+  margin-top: 2px;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+#lineup-title {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: color-mix(in srgb, var(--glow) 74%, white 26%);
+}
+
+#lineup-summary {
+  margin-top: 6px;
+  font-size: 12px;
+  color: rgba(238, 247, 255, 0.78);
+}
+
+#lineup-items {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.lineup-item {
+  padding: 10px 11px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.lineup-item.primary {
+  border-color: color-mix(
+    in srgb,
+    var(--accent) 55%,
+    rgba(255, 255, 255, 0.12)
+  );
+}
+
+.lineup-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.lineup-item-label {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.lineup-item-status {
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  background: rgba(255, 255, 255, 0.08);
+  color: color-mix(in srgb, var(--accent) 68%, white 32%);
+}
+
+.lineup-item-role {
+  margin-top: 5px;
+  font-size: 11px;
+  color: rgba(238, 247, 255, 0.72);
+}
+
+.lineup-item-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 7px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: rgba(238, 247, 255, 0.58);
+}
+
+#hint {
+  right: 14px;
+  bottom: 14px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: rgba(238, 247, 255, 0.82);
+}
+
+@media (max-width: 720px) {
+  #status,
+  #action-panel,
+  #title-block,
+  #lineup-panel,
+  #hint {
+    max-width: calc(100% - 28px);
+  }
+
+  #lineup-panel {
+    top: 60px;
+  }
+
+  #action-panel {
+    bottom: 52px;
+  }
+}

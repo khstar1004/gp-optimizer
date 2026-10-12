@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "bundles": {
+    "drone": {
+      "label": "Drone Bundle",
+      "path": "/3d-bundles/drone/models",
+      "autoSyncTargets": []
+    },
+    "aircraft": {
+      "label": "Aircraft Bundle",
+      "path": "/3d-bundles/aircraft/models",
+      "autoSyncTargets": []
+    },
+    "artillery": {
+      "label": "Artillery Bundle",
+      "path": "/3d-bundles/artillery/models",
+      "autoSyncTargets": []
+    },
+    "ships": {
+      "label": "Ship Bundle",
+      "path": "/3d-bundles/ships",
+      "autoSyncTargets": []
+    },
+    "tank": {
+      "label": "Tank Bundle",
+      "path": "/3d-bundles/tank/models",
+      "autoSyncTargets": []
+    },
+    "infrastructure": {
+      "label": "Infrastructure Bundle",
+      "path": "/3d-bundles/infrastructure/models",
+      "autoSyncTargets": []
+    },
+    "personnel": {
+      "label": "Personnel Bundle",
+      "path": "/3d-bundles/personnel/models",
+      "autoSyncTargets": []
+    },
+    "robotics": {
+      "label": "Robotics Bundle",
+      "path": "/3d-bundles/robotics/models",
+      "autoSyncTargets": []
+    },
+    "effects": {
+      "label": "Effects Bundle",
+      "path": "/3d-bundles/effects",
+      "autoSyncTargets": []
+    },
+    "viewer": {
+      "label": "Shared Viewer",
+      "path": "/3d-bundles/viewer",
+      "autoSyncTargets": []
+    }
+  }
+}
