@@ -1,0 +1,333 @@
+{
+  "n_units": 600,
+  "n_log_rows": 50400,
+  "n_sites": 40,
+  "n_train_rows": 2400,
+  "n_test_rows": 600,
+  "test_events": 120,
+  "test_severe": 37,
+  "recall_top20_rep": 0.0,
+  "recall_top20_ma": 0.3783783783783784,
+  "recall_top20_model": 0.40540540540540543,
+  "k10": 60,
+  "recall_k10_rep": 0.06666666666666667,
+  "recall_k10_ma": 0.3416666666666667,
+  "recall_k10_model": 0.30833333333333335,
+  "wape_rep": 0.68780093444399,
+  "wape_ma": 0.5795584121611748,
+  "wape_model": 0.3959732217757546,
+  "budget": 216.98045048160864,
+  "actual_total": 482.1787788480192,
+  "port_model": {
+    "n": 55,
+    "events": 33,
+    "severe": 15,
+    "exec_cost": 173.77070386012673,
+    "overrun_pct": -19.885475340982083,
+    "exclusive_viol": 0,
+    "mandatory_missed": 0,
+    "planned": 216.9028707337735
+  },
+  "port_rep": {
+    "n": 55,
+    "events": 39,
+    "severe": 16,
+    "exec_cost": 186.13043202030372,
+    "overrun_pct": -13.465169665969434,
+    "exclusive_viol": 4,
+    "mandatory_missed": 0,
+    "planned": 215.09308021039283,
+    "feasible_events": 36,
+    "feasible_severe": 15,
+    "feasible_n": 51
+  },
+  "mandatory_n": 4,
+  "mandatory_missed_rep": 0,
+  "mandatory_missed_model": 0,
+  "k80_rep": 299,
+  "k80_ma": 312,
+  "k80_model": 255,
+  "top_features": [
+    [
+      "grade_last",
+      0.37235933326695647
+    ],
+    [
+      "grade_max12",
+      0.09404893208789415
+    ],
+    [
+      "drainage_weak",
+      0.06502061999346519
+    ],
+    [
+      "comp_배관·전기",
+      0.06320710713771134
+    ],
+    [
+      "freeze_12",
+      0.05771784741035082
+    ],
+    [
+      "grade_slope",
+      0.05585799973371789
+    ],
+    [
+      "age",
+      0.04027068732301266
+    ],
+    [
+      "rate_hist",
+      0.04025359684820634
+    ]
+  ],
+  "example": {
+    "id": "S011-F3-기초·배수",
+    "ftype": "급수·배수",
+    "comp": "기초·배수",
+    "age": 18,
+    "grade_last": 2.9,
+    "grade_slope": 1.09,
+    "drainage_weak": 0.93,
+    "slope_deg": 26.2,
+    "access_diff": 0.23,
+    "precip_summer_clim": 198,
+    "freeze_clim": 15.3,
+    "events_24": 0,
+    "p_event": 0.49,
+    "p_severe": 0.31,
+    "cost_if": 3.8,
+    "rank_ma": 152,
+    "rank_model": 44,
+    "y_cost": 6.1,
+    "n_units": 600
+  },
+  "rolling": {
+    "2023": {
+      "top30_model": 0.13333333333333333,
+      "top30_ma": 0.4,
+      "k80_model": 290,
+      "k80_ma": 291,
+      "wape_model": 0.5661310021243896,
+      "wape_ma": 0.7394942985421946,
+      "events": 92,
+      "severe": 30
+    },
+    "2024": {
+      "top30_model": 0.3170731707317073,
+      "top30_ma": 0.3170731707317073,
+      "k80_model": 243,
+      "k80_ma": 305,
+      "wape_model": 0.5122364605750773,
+      "wape_ma": 0.6106979317218965,
+      "events": 107,
+      "severe": 41
+    },
+    "2025": {
+      "top30_model": 0.40540540540540543,
+      "top30_ma": 0.3783783783783784,
+      "k80_model": 255,
+      "k80_ma": 312,
+      "wape_model": 0.3959732217757546,
+      "wape_ma": 0.5795584121611748,
+      "events": 120,
+      "severe": 37
+    }
+  },
+  "rolling_mean": {
+    "top30_model": 0.2852706364901487,
+    "top30_ma": 0.36515051637002854,
+    "k80_model": 262.6666666666667,
+    "k80_ma": 302.6666666666667,
+    "wape_model": 0.4914468948250738,
+    "wape_ma": 0.6432502141417553,
+    "events": 106.33333333333333,
+    "severe": 36.0
+  },
+  "ablation": {
+    "full": {
+      "top30_model": 0.40540540540540543,
+      "top30_ma": 0.3783783783783784,
+      "k80_model": 255,
+      "k80_ma": 312,
+      "wape_model": 0.3959732217757546,
+      "wape_ma": 0.5795584121611748,
+      "events": 120,
+      "severe": 37
+    },
+    "no_weather": {
+      "top30_model": 0.3783783783783784,
+      "top30_ma": 0.3783783783783784,
+      "k80_model": 258,
+      "k80_ma": 312,
+      "wape_model": 0.39493388728665335,
+      "wape_ma": 0.5795584121611748,
+      "events": 120,
+      "severe": 37
+    },
+    "no_terrain": {
+      "top30_model": 0.32432432432432434,
+      "top30_ma": 0.3783783783783784,
+      "k80_model": 295,
+      "k80_ma": 312,
+      "wape_model": 0.4241348325283628,
+      "wape_ma": 0.5795584121611748,
+      "events": 120,
+      "severe": 37
+    },
+    "no_history": {
+      "top30_model": 0.35135135135135137,
+      "top30_ma": 0.3783783783783784,
+      "k80_model": 277,
+      "k80_ma": 312,
+      "wape_model": 0.407640327798038,
+      "wape_ma": 0.5795584121611748,
+      "events": 120,
+      "severe": 37
+    },
+    "grade_only": {
+      "top30_model": 0.2972972972972973,
+      "top30_ma": 0.3783783783783784,
+      "k80_model": 278,
+      "k80_ma": 312,
+      "wape_model": 0.4781830992787589,
+      "wape_ma": 0.5795584121611748,
+      "events": 120,
+      "severe": 37
+    }
+  },
+  "top_rows": [
+    {
+      "id": "S011-F0-기초·배수",
+      "ftype": "생활관",
+      "comp": "기초·배수",
+      "grade": 3.6,
+      "p": 0.91,
+      "ps": 0.46,
+      "cost": 9.3,
+      "sel": true,
+      "rank_ma": 46
+    },
+    {
+      "id": "S004-F2-배관·전기",
+      "ftype": "창고",
+      "comp": "배관·전기",
+      "grade": 3.9,
+      "p": 0.88,
+      "ps": 0.16,
+      "cost": 2.6,
+      "sel": true,
+      "rank_ma": 26
+    },
+    {
+      "id": "S029-F0-배관·전기",
+      "ftype": "생활관",
+      "comp": "배관·전기",
+      "grade": 4.0,
+      "p": 0.88,
+      "ps": 0.63,
+      "cost": 3.5,
+      "sel": true,
+      "rank_ma": 21
+    },
+    {
+      "id": "S005-F1-배관·전기",
+      "ftype": "정비고",
+      "comp": "배관·전기",
+      "grade": 4.0,
+      "p": 0.87,
+      "ps": 0.15,
+      "cost": 4.3,
+      "sel": true,
+      "rank_ma": 19
+    },
+    {
+      "id": "S005-F2-기초·배수",
+      "ftype": "창고",
+      "comp": "기초·배수",
+      "grade": 4.1,
+      "p": 0.86,
+      "ps": 0.38,
+      "cost": 3.6,
+      "sel": true,
+      "rank_ma": 17
+    },
+    {
+      "id": "S020-F0-배관·전기",
+      "ftype": "생활관",
+      "comp": "배관·전기",
+      "grade": 4.2,
+      "p": 0.86,
+      "ps": 0.06,
+      "cost": 6.9,
+      "sel": true,
+      "rank_ma": 12
+    },
+    {
+      "id": "S023-F4-배관·전기",
+      "ftype": "전원시설",
+      "comp": "배관·전기",
+      "grade": 3.9,
+      "p": 0.85,
+      "ps": 0.42,
+      "cost": 2.8,
+      "sel": true,
+      "rank_ma": 29
+    },
+    {
+      "id": "S014-F4-배관·전기",
+      "ftype": "전원시설",
+      "comp": "배관·전기",
+      "grade": 4.1,
+      "p": 0.83,
+      "ps": 0.76,
+      "cost": 5.2,
+      "sel": true,
+      "rank_ma": 14
+    },
+    {
+      "id": "S035-F2-배관·전기",
+      "ftype": "창고",
+      "comp": "배관·전기",
+      "grade": 4.1,
+      "p": 0.81,
+      "ps": 0.34,
+      "cost": 3.2,
+      "sel": true,
+      "rank_ma": 16
+    },
+    {
+      "id": "S027-F3-배관·전기",
+      "ftype": "급수·배수",
+      "comp": "배관·전기",
+      "grade": 4.8,
+      "p": 0.81,
+      "ps": 0.82,
+      "cost": 4.2,
+      "sel": true,
+      "rank_ma": 3
+    },
+    {
+      "id": "S039-F1-배관·전기",
+      "ftype": "정비고",
+      "comp": "배관·전기",
+      "grade": 3.6,
+      "p": 0.77,
+      "ps": 0.22,
+      "cost": 4.6,
+      "sel": true,
+      "rank_ma": 48
+    },
+    {
+      "id": "S033-F3-배관·전기",
+      "ftype": "급수·배수",
+      "comp": "배관·전기",
+      "grade": 3.8,
+      "p": 0.77,
+      "ps": 0.22,
+      "cost": 2.7,
+      "sel": true,
+      "rank_ma": 32
+    }
+  ]
+}

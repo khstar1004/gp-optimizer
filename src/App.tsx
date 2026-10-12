@@ -1,0 +1,484 @@
+import { useEffect, useRef, useState } from 'react';
+import { iconMarkup, type IconName } from './runtime/icons';
+import { sessionRegistry } from './runtime/sessionRegistry';
+import { TERRAIN_CATALOG, CUSTOM_TERRAIN_ID, findTerrain } from './runtime/terrainCatalog';
+import { SITE } from './runtime/data';
+
+const TAB_IDS = ['twin', 'gis', 'training', 'build', 'forecast', 'watch', 'infil', 'ipb', 'fires', 'decision', 'guide'] as const;
+type TabId = typeof TAB_IDS[number];
+const TAB_LABELS: Record<TabId, [IconName, string]> = {
+  twin: ['twin', '트윈'], gis: ['map', '지도'], training: ['training', '훈련근거'],
+  build: ['build', '배치'], forecast: ['clipboard', '예측'], watch: ['watch', '감시'], infil: ['infil', '침투'], ipb: ['ipb', '분석'],
+  fires: ['fires', '화력'], decision: ['decision', '결심'], guide: ['guide', '설명서'],
+};
+// 평시·전시 임무 구분 — 트윈/지도/배치/훈련근거/감시는 부지를 만들고 지키는
+// 평시 업무, 침투/분석/화력/결심은 실제 교전 상황의 전시 업무다. 레일은 늘
+// 한쪽 목표군만 보여줘서 「지금 뭘 준비하는 중인지」를 헷갈리지 않게 한다.
+type OpsMode = 'peace' | 'war';
+const PEACE_TABS: readonly TabId[] = ['twin', 'gis', 'build', 'forecast', 'training', 'watch'];
+const WAR_TABS: readonly TabId[] = ['infil', 'ipb', 'fires', 'decision'];
+const LS_OPS_MODE = 'gp_ops_mode_v1';
+
+function isWarTab(tab: TabId): boolean {
+  return (WAR_TABS as readonly string[]).includes(tab);
+}
+
+function isTabId(value: unknown): value is TabId {
+  return typeof value === 'string' && (TAB_IDS as readonly string[]).includes(value);
+}
+
+function RuntimeHealthBadge() {
+  const [online, setOnline] = useState<boolean | null>(null);
+  const [health, setHealth] = useState<{
+    checks?: {
+      storage?: boolean;
+      vworld?: boolean;
+      maptiler?: boolean;
+      vistaBundles?: boolean;
+      ollama?: { configured?: boolean; model?: string | null };
+    };
+  } | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const check = async () => {
+      try {
+        const response = await fetch('/api/health', { headers: { Accept: 'application/json' } });
+        if (!response.ok) {
+          if (active) { setOnline(false); setHealth(null); }
+          return;
+        }
+        const payload = await response.json().catch(() => null);
+        if (active) { setOnline(true); setHealth(payload); }
+      } catch {
+        if (active) { setOnline(false); setHealth(null); }
+      }
+    };
+    void check();
+    const timer = window.setInterval(check, 30_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
+
+  const checks = health?.checks;
+  const configured = checks
+    ? [checks.storage, checks.vworld, checks.maptiler, checks.vistaBundles, checks.ollama?.configured]
+      .filter((value) => value !== undefined).every(Boolean)
+    : null;
+  const label = online !== true ? (online === false ? 'API 오프라인' : 'API 확인 중')
+    : configured === false ? 'API 부분연결' : 'API 연결됨';
+  const detail = checks
+    ? `저장 ${checks.storage ? '정상' : '확인필요'} · Ollama ${checks.ollama?.configured ? (checks.ollama.model || '연결') : '미가동'} · VWorld ${checks.vworld ? '키 있음' : '키 없음'} · MapTiler ${checks.maptiler ? '키 있음' : '키 없음'} · 3D ${checks.vistaBundles ? '정상' : '없음'}`
+    : '런타임 상태를 확인하는 중입니다.';
+  return <span className={`chip ${online === true && configured !== false ? 'chip-live' : ''}`} id="tsx-api-status" aria-live="polite" title={detail}>{label}</span>;
+}
+
+type TerrainRef = { catalogId: string; gp?: { lon: number; lat: number }; hub?: { lon: number; lat: number }; name?: string };
+type SessionMeta = {
+  id: string; name: string; favorite: boolean; createdAt: string; updatedAt: string; terrain?: TerrainRef;
+};
+
+function terrainLabel(terrain?: TerrainRef): string {
+  if (!terrain || terrain.catalogId !== CUSTOM_TERRAIN_ID) return findTerrain('gp-107')?.name ?? 'GP-107';
+  return terrain.name?.trim() || '사용자 지정 위치';
+}
+
+type SessionPreview = { items: number; ipb: number; towerHeight: number | null; posts: number } | null;
+
+/** 세션에 들어가 보지 않고도 무엇이 들어있는지 — 지형 옆에 붙는 요약. */
+function previewLabel(preview: SessionPreview): string {
+  if (!preview) return '아직 열어본 적 없음';
+  const parts = [`시설 ${preview.items}동`];
+  if (preview.posts) parts.push(`감시 ${preview.posts}개`);
+  if (preview.ipb) parts.push(`전술도식 ${preview.ipb}개`);
+  return parts.join(' · ');
+}
+
+/**
+ * 좌측 상단 세션 스위처 — 세션마다 완전히 새로운 시작(지형·타워·부지조성·미션·훈련근거가
+ * 전부 그 세션 것으로 다시 부팅됨)을 오가는 창구.
+ *
+ * 이 앱은 지형·타워 등을 부팅(boot()) 시 한 번만 만들기 때문에, 세션 전환·생성·(활성
+ * 세션) 삭제는 전부 `sessionRegistry`가 활성 세션을 바꾼 뒤 페이지를 새로고침하는
+ * 방식으로 처리한다(sessionRegistry.ts 설명 참고) — 그래서 이 컴포넌트는 3D 런타임이
+ * 아직 안 떠 있어도(부팅 중이어도) 완전히 동작한다.
+ */
+function SessionSwitcher() {
+  const [open, setOpen] = useState(false);
+  const [, forceRerender] = useState(0);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState('');
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [newTerrainId, setNewTerrainId] = useState<string>('gp-107');
+  const [newLon, setNewLon] = useState('');
+  const [newLat, setNewLat] = useState('');
+  const rootRef = useRef<HTMLDivElement>(null);
+  const confirmTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    const bump = () => forceRerender((n) => n + 1);
+    window.addEventListener('gp:sessions-changed', bump);
+    return () => window.removeEventListener('gp:sessions-changed', bump);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onOutside = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) { setOpen(false); setCreating(false); }
+    };
+    document.addEventListener('mousedown', onOutside);
+    return () => document.removeEventListener('mousedown', onOutside);
+  }, [open]);
+
+  const sessions: SessionMeta[] = sessionRegistry.list();
+  const activeId = sessionRegistry.getActiveId();
+  const active = sessions.find((s) => s.id === activeId) ?? sessions[0];
+
+  const armDelete = (id: string) => {
+    window.clearTimeout(confirmTimer.current);
+    if (confirmDeleteId === id) {
+      setConfirmDeleteId(null);
+      sessionRegistry.remove(id); // 활성 세션이었으면 내부에서 알아서 새로고침한다
+      return;
+    }
+    setConfirmDeleteId(id);
+    confirmTimer.current = window.setTimeout(() => setConfirmDeleteId(null), 4000);
+  };
+
+  const startRename = (s: SessionMeta) => { setEditingId(s.id); setEditValue(s.name); };
+  const commitRename = () => {
+    if (editingId) sessionRegistry.rename(editingId, editValue);
+    setEditingId(null);
+  };
+
+  const resetCreateForm = () => {
+    setCreating(false); setNewName(''); setNewTerrainId('gp-107'); setNewLon(''); setNewLat('');
+  };
+
+  const confirmCreate = () => {
+    let terrain: TerrainRef = { catalogId: 'gp-107' };
+    if (newTerrainId === CUSTOM_TERRAIN_ID) {
+      const lon = Number(newLon);
+      const lat = Number(newLat);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat) || lon < -180 || lon > 180 || lat < -90 || lat > 90) {
+        return; // 버튼이 disabled라 보통 여기 안 옴 — 방어적 무시
+      }
+      terrain = { catalogId: CUSTOM_TERRAIN_ID, gp: { lon, lat }, name: newName };
+    }
+    const created = sessionRegistry.create(newName, terrain);
+    resetCreateForm();
+    sessionRegistry.switchTo(created.id); // 완전히 새로운 시작 — 그 지형으로 다시 부팅
+  };
+
+  const customCoordsValid = newTerrainId !== CUSTOM_TERRAIN_ID
+    || (Number.isFinite(Number(newLon)) && Number.isFinite(Number(newLat))
+      && Math.abs(Number(newLon)) <= 180 && Math.abs(Number(newLat)) <= 90 && newLon !== '' && newLat !== '');
+
+  return (
+    <div className="session-switch" ref={rootRef}>
+      <button id="session-switch-btn" className="session-switch-btn" onClick={() => setOpen((v) => !v)}
+        title="세션 전환 — 완전히 새로운 시작" aria-expanded={open}>
+        <span className="ssw-mark">◧</span>
+        <span className="ssw-name">{active?.name ?? '세션'}</span>
+        <span className="ssw-terrain">{terrainLabel(active?.terrain)}</span>
+        <span className="ssw-caret">▾</span>
+      </button>
+      {open && (
+        <div className="session-pop" role="menu">
+          <div className="ssp-list">
+            {sessions.map((s) => (
+              <div key={s.id} className={`ssp-row ${s.id === activeId ? 'active' : ''}`}>
+                <button className="ssp-fav" title={s.favorite ? '즐겨찾기 해제' : '즐겨찾기'}
+                  onClick={() => sessionRegistry.setFavorite(s.id, !s.favorite)}>{s.favorite ? '★' : '☆'}</button>
+                <div className="ssp-main">
+                  {editingId === s.id ? (
+                    <input className="ssp-edit" autoFocus value={editValue} maxLength={60}
+                      onChange={(e) => setEditValue(e.target.value)}
+                      onBlur={commitRename}
+                      onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setEditingId(null); }} />
+                  ) : (
+                    <button className="ssp-name" title="클릭하여 이 세션으로 전환(새로고침)"
+                      onClick={() => sessionRegistry.switchTo(s.id)}>{s.name}</button>
+                  )}
+                  <span className="ssp-terrain-tag">{terrainLabel(s.terrain)} · {previewLabel(sessionRegistry.preview(s.id))}</span>
+                </div>
+                <button className="ssp-btn" title="이름 바꾸기" onClick={() => startRename(s)}>✎</button>
+                <button className="ssp-btn" title="이 세션을 복제해 변형 만들기"
+                  onClick={async () => { const clone = await sessionRegistry.duplicate(s.id); if (clone) sessionRegistry.switchTo(clone.id); }}>⧉</button>
+                <button className={`ssp-btn ssp-del ${confirmDeleteId === s.id ? 'armed' : ''}`}
+                  title="세션 삭제" onClick={() => armDelete(s.id)}>{confirmDeleteId === s.id ? '삭제?' : '✕'}</button>
+              </div>
+            ))}
+          </div>
+          {creating ? (
+            <div className="ssp-create">
+              <input className="ssp-create-name" autoFocus placeholder="세션 이름 (예: 탑+감시자산)"
+                value={newName} maxLength={60} onChange={(e) => setNewName(e.target.value)} />
+              <label className="ssp-create-lab">지형</label>
+              <select className="ssp-create-sel" value={newTerrainId} onChange={(e) => setNewTerrainId(e.target.value)}>
+                {TERRAIN_CATALOG.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+              <p className="ssp-create-blurb">{findTerrain(newTerrainId)?.blurb}</p>
+              {newTerrainId === CUSTOM_TERRAIN_ID && (
+                <div className="ssp-create-coords">
+                  <input type="number" step="0.0001" placeholder="경도(lon)" value={newLon}
+                    onChange={(e) => setNewLon(e.target.value)} />
+                  <input type="number" step="0.0001" placeholder="위도(lat)" value={newLat}
+                    onChange={(e) => setNewLat(e.target.value)} />
+                </div>
+              )}
+              <div className="ssp-create-actions">
+                <button className="btn" onClick={resetCreateForm}>취소</button>
+                <button className="btn primary" disabled={!customCoordsValid} onClick={confirmCreate}>세션 만들기</button>
+              </div>
+            </div>
+          ) : (
+            <button className="ssp-add" onClick={() => setCreating(true)}>＋ 새 세션</button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TabButton({ tab, active, onSelect }: { tab: TabId; active: boolean; onSelect: (tab: TabId) => void }) {
+  return (
+    <button className={`tab ${tab === 'guide' ? 'tab-guide' : ''} ${active ? 'active' : ''}`}
+      data-tab={tab} data-react-managed="true" title={TAB_LABELS[tab][1]}
+      aria-current={active ? 'page' : undefined} onClick={() => onSelect(tab)}>
+      <span className="rt-ic" dangerouslySetInnerHTML={{ __html: iconMarkup(TAB_LABELS[tab][0]) }} /><span className="rt-lb">{TAB_LABELS[tab][1]}</span>
+    </button>
+  );
+}
+
+/**
+ * React owns the stable application shell.  The Cesium scene and the existing
+ * feature controllers stay imperative behind the TypeScript runtime entry so frame-by-frame
+ * entity updates never become React render work.
+ */
+export function AppShell() {
+  const runtimeStarted = useRef(false);
+  // 진입 모드는 URL의 `?demo=damage`(→ 화력, 전시) 또는 마지막으로 있던 모드를
+  // 기억한다. 활성 탭은 그 모드에 맞춰 골라야 한다 — 그러지 않으면 새로고침했을 때
+  // 「전시」가 켜져 있는데 화면엔 평시 전용 탭 내용이 뜨는 불일치가 생긴다.
+  const initialOpsMode = (): OpsMode => {
+    if (new URLSearchParams(location.search).get('demo') === 'damage') return 'war';
+    return localStorage.getItem(LS_OPS_MODE) === 'war' ? 'war' : 'peace';
+  };
+  const initialTab = (mode: OpsMode): TabId => {
+    if (new URLSearchParams(location.search).get('demo') === 'damage') return 'fires';
+    return mode === 'war' ? WAR_TABS[0] : PEACE_TABS[0];
+  };
+  const [opsMode, setOpsMode] = useState<OpsMode>(initialOpsMode);
+  const [activeTab, setActiveTab] = useState<TabId>(() => initialTab(initialOpsMode()));
+  const visibleTabs = opsMode === 'war' ? WAR_TABS : PEACE_TABS;
+
+  useEffect(() => {
+    // 이제 모든 탭이 실제 3D 지도 위에서 돈다 — 런타임을 한 번만 올린다.
+    if (runtimeStarted.current) return;
+    runtimeStarted.current = true;
+    void import('./runtime/main').catch((error) => {
+      console.error('[gp-digital-twin] runtime bootstrap failed', error);
+    });
+  }, []);
+
+  useEffect(() => {
+    const handleLegacyNavigation = (event: Event) => {
+      const tab = (event as CustomEvent<unknown>).detail;
+      if (!isTabId(tab)) return;
+      // 다른 탭 안에서 걸어온 링크(예: 침투 판정 → 화력 탭)일 수도 있으니
+      // 그 탭이 속한 쪽으로 모드까지 같이 넘어가 준다.
+      setOpsMode(isWarTab(tab) ? 'war' : 'peace');
+      setActiveTab(tab);
+    };
+    window.addEventListener('gp:tab-active', handleLegacyNavigation);
+    return () => window.removeEventListener('gp:tab-active', handleLegacyNavigation);
+  }, []);
+
+  const selectTab = (tab: TabId) => {
+    setActiveTab(tab);
+    window.dispatchEvent(new CustomEvent('gp:tab-change', { detail: tab }));
+  };
+
+  const selectMode = (mode: OpsMode) => {
+    if (mode === opsMode) return;
+    setOpsMode(mode);
+    try { localStorage.setItem(LS_OPS_MODE, mode); } catch { /* noop */ }
+    const tabs = mode === 'war' ? WAR_TABS : PEACE_TABS;
+    if (!(tabs as readonly string[]).includes(activeTab)) selectTab(tabs[0]);
+  };
+
+  return (
+    <>
+      <div id="intro">
+        <div>
+          <div className="intro-title">GP Digital Twin</div>
+          <div className="intro-sub">GP 디지털트윈 — 배치·비용·침투·작전분석</div>
+        </div>
+      </div>
+      <div id="app">
+        <header id="topbar">
+          <div className="brand">
+            <span className="brand-mark">◈</span>
+            <span className="brand-name">GP Digital Twin</span>
+            <span className="brand-sub">GP 디지털트윈</span>
+            <SessionSwitcher />
+          </div>
+          <div className="top-status">
+            <button id="cmdk-hint" title="명령 팔레트 (Ctrl+K)">⌘K 명령</button>
+            <button id="panel-toggle" title="패널 접기/펴기">☰ 패널</button>
+            <RuntimeHealthBadge />
+            <span className={`chip ${opsMode === 'war' ? 'chip-war' : 'chip-peace'}`}>
+              {opsMode === 'war' ? '⚔ 전시 모드' : '☀ 평시 모드'}
+            </span>
+            <span className="chip chip-synth">합성 데모 · 실기준 아님</span>
+            <span className="chip" id="chip-site">{SITE.name}</span>
+          </div>
+        </header>
+
+        <aside id="panel" className="rail-mode">
+          <nav id="tabs">
+            <div className="mode-switch" role="tablist" aria-label="평시/전시 전환">
+              <button type="button" className={`mode-btn mode-peace ${opsMode === 'peace' ? 'active' : ''}`}
+                role="tab" aria-selected={opsMode === 'peace'}
+                title="평시 — 트윈·지도·배치·훈련근거·감시" onClick={() => selectMode('peace')}>
+                <span className="rt-ic">☀</span><span className="rt-lb">평시</span>
+              </button>
+              <button type="button" className={`mode-btn mode-war ${opsMode === 'war' ? 'active' : ''}`}
+                role="tab" aria-selected={opsMode === 'war'}
+                title="전시 — 침투·분석·화력·결심" onClick={() => selectMode('war')}>
+                <span className="rt-ic">⚔</span><span className="rt-lb">전시</span>
+              </button>
+            </div>
+            {visibleTabs.map((tab) => <TabButton key={tab} tab={tab} active={activeTab === tab} onSelect={selectTab} />)}
+            <TabButton tab="guide" active={activeTab === 'guide'} onSelect={selectTab} />
+          </nav>
+          <div id="panel-body">
+            <section className={`tab-page ${activeTab === 'twin' ? 'active' : ''}`} id="page-twin" />
+            <section className={`tab-page ${activeTab === 'gis' ? 'active' : ''}`} id="page-gis" />
+            <section className={`tab-page ${activeTab === 'training' ? 'active' : ''}`} id="page-training" />
+            <section className={`tab-page ${activeTab === 'build' ? 'active' : ''}`} id="page-build" />
+            <section className={`tab-page ${activeTab === 'forecast' ? 'active' : ''}`} id="page-forecast" />
+            <section className={`tab-page ${activeTab === 'watch' ? 'active' : ''}`} id="page-watch" />
+            <section className={`tab-page ${activeTab === 'infil' ? 'active' : ''}`} id="page-infil" />
+            <section className={`tab-page ${activeTab === 'ipb' ? 'active' : ''}`} id="page-ipb" />
+            <section className={`tab-page ${activeTab === 'fires' ? 'active' : ''}`} id="page-fires" />
+            <section className={`tab-page ${activeTab === 'decision' ? 'active' : ''}`} id="page-decision" />
+            <section className={`tab-page ${activeTab === 'guide' ? 'active' : ''}`} id="page-guide" />
+          </div>
+        </aside>
+
+        <main id="map-wrap">
+          <div id="cesiumContainer" />
+          <div id="map-hud"><div id="hud-metrics" /></div>
+          <div id="map-legend" className="hidden" />
+
+          <div id="fpv-overlay" className="hidden">
+            {/* 계기는 전부 캔버스 한 장에 그린다 — 방위 테이프·부앙 사다리·조준선·
+                LRF·유효거리·자산별 계기까지 (opticHud). DOM 은 조작 스트립만 맡는다. */}
+            <canvas id="fpv-hud" />
+            <div id="fpv-bottom">
+              <div className="fpv-card">
+                <div className="fpv-row fpv-id">
+                  <span id="fpv-optic" className="fpv-badge">EYE</span>
+                  <b id="fpv-title">1인칭 관측</b>
+                </div>
+                <div className="fpv-row fpv-subrow"><span id="fpv-sub" /></div>
+                <div className="fpv-row fpv-optics">
+                  <span className="fpv-lab">배율</span>
+                  <span id="fpv-zooms" className="fpv-zooms" />
+                  <span id="fpv-tools" className="fpv-tools" />
+                </div>
+                {/* 작전 조작 — 잡고(T) → 넘기고(C) → 밝히고(I) → 보고한다(S) */}
+                <div className="fpv-row fpv-ops" id="fpv-ops" />
+                <div className="fpv-row" id="fpv-height-row"><span id="fpv-height-label">관측고</span>
+                  <input type="range" id="fpv-height" min="6" max="40" step="1" defaultValue="18" />
+                  <b id="fpv-height-val">18m</b>
+                  <span id="fpv-cost" className="fpv-cost">타워 —억</span>
+                </div>
+                <div className="fpv-row fpv-switch" id="fpv-switch" />
+                <div className="fpv-row muted" id="fpv-hint">드래그: 둘러보기 · 휠: 배율단</div>
+              </div>
+              <button className="btn" id="fpv-exit">시점 종료 ✕</button>
+            </div>
+          </div>
+
+          <div id="status-bar">
+            <span id="sb-mgrs">MGRS —</span><span id="sb-ll">—</span><span id="sb-elev">표고 —</span>
+            <span id="sb-cam">고도 —</span><span id="sb-clock" />
+          </div>
+
+          <div id="walk-overlay" className="hidden">
+            {/* 드론(.uas)일 때는 opticHud 가 조종석 계기를 이 캔버스에 그린다 */}
+            <canvas id="uas-hud" />
+            <div id="wk-cross">+</div><div id="wk-top"><span id="wk-mode">도보 정찰</span></div>
+            <div id="wk-bottom"><div id="wk-info">—</div><div id="wk-hint">—</div></div>
+            <button className="btn" id="wk-exit">시점 종료 ✕</button>
+          </div>
+
+          {/* 상시 감시 로그 — 내가 보고 있지 않아도 자산은 계속 판정한다 */}
+          <div id="watch-log" className="hidden">
+            <div className="wg-head">
+              <span className="wg-dot" />
+              <span className="wg-title">상시 감시</span>
+              <span className="wg-count" id="wg-count">0</span>
+              <button className="wg-btn" id="wg-toggle" title="접기/펴기">▾</button>
+            </div>
+            <div id="wg-rows" />
+          </div>
+
+          {/* 관측보고 — 화면 한 장이 그대로 보고문 한 장이 된다 */}
+          <div id="spot-card" className="hidden">
+            <div className="pc-head"><span id="spot-title">관측보고 (SPOTREP)</span><button id="spot-close" aria-label="닫기">✕</button></div>
+            <div id="spot-body">
+              <img id="spot-shot" alt="관측 화면 캡처" />
+              <pre id="spot-text" />
+            </div>
+            <div className="spot-actions">
+              <button className="btn primary" id="spot-png">⬇ 화면 PNG</button>
+              <button className="btn" id="spot-txt">⬇ 보고문 TXT</button>
+              <button className="btn" id="spot-copy">보고문 복사</button>
+            </div>
+          </div>
+
+          <div id="fire-card" className="hidden">
+            <div className="pc-head"><span>교전 제원 (FIRE MISSION)</span><button id="fire-close" aria-label="닫기">✕</button></div>
+            <div id="fire-body" />
+          </div>
+
+          <div id="eval-panel" className="hidden">
+            <div className="ev-head"><div><span className="ev-title">작전 평가보고서</span><span className="ev-sub" id="eval-model">—</span></div><button id="eval-close" aria-label="닫기">✕</button></div>
+            <div id="eval-body"><div className="ev-loading" id="eval-loading"><div className="loader-ring" /><div id="eval-stage">분석 준비…</div></div></div>
+          </div>
+
+          <div id="aar-card" className="hidden">
+            <div className="pc-head"><span id="aar-title">AAR — 탐지·교전 판정</span><button id="aar-close" aria-label="닫기">✕</button></div>
+            <canvas id="aar-canvas" /><div className="pc-stats" id="aar-stats" /><div id="aar-reco" />
+          </div>
+
+          <div id="profile-card" className="hidden">
+            <div className="pc-head"><span>고도 프로파일 · 가시선</span><button id="profile-close" aria-label="닫기">✕</button></div>
+            <canvas id="profile-canvas" /><div className="pc-stats" id="profile-stats" />
+          </div>
+
+          <div id="timeline-bar" className="hidden">
+            <button id="sim-play">▶</button><input type="range" id="sim-time" min="0" max="100" defaultValue="0" /><span id="sim-clock">T+00:00</span>
+          </div>
+
+          <div id="bp-modal" className="hidden">
+            <div className="bp-sheet">
+              <div className="bp-head"><span>A3 배치계획도 미리보기</span><span className="bp-meta" id="bp-meta" />
+                <div className="bp-actions"><button className="btn primary" id="bp-download">⬇ PNG 다운로드</button><button className="btn" id="bp-close">닫기</button></div>
+              </div>
+              <div className="bp-body" id="bp-canvas-wrap" />
+            </div>
+          </div>
+
+          <div id="toast" role="status" aria-live="polite" />
+          <div id="loading-overlay" role="status" aria-live="polite"><div className="loader-box"><div className="loader-ring" /><div id="loading-text">지형 데이터 로딩 중…</div></div></div>
+        </main>
+      </div>
+    </>
+  );
+}

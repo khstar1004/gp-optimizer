@@ -1,0 +1,4339 @@
+// @ts-nocheck
+/**
+ * GP Digital Twin — 오케스트레이터
+ * 탭: 트윈(1인칭·투어) / 배치(드래그앤드랍·실시간비용) / 침투(도보·차량 3D) / 작전분석(NAI·DP·TAI)
+ */
+import { SITE, ENV_PRESETS, MOVE_MODES } from './data';
+import { initViewer, flyTo, cinematicTour, cancelTour } from './map';
+import { CinematicOverlay } from './cinematic';
+import { SiteEntities } from './entities';
+import { computeViewshed, rasterize, sectorCoverage } from './viewshed';
+import { facilityScore, coverageRaster } from './siteOptimizer';
+import { Tutorial, COURSES, NEW_FEATURES, injectHelpBadges } from './tutorial';
+import { initUxShell } from './uxShell';
+import { svgIcon } from './icons';
+import { MapInspector } from './mapInspector';
+import { initMapContext } from './mapContext';
+import { SensorFeed } from './sensorFeed';
+import { SensorPostLayer, POST_TYPE, POST_HANDLE_RE } from './sensorPosts';
+import { createSurveillanceTab } from './surveillanceTab';
+import { atmosphereOf, effectiveRanges, fmtM as fmtRange } from './sensorPerformance';
+import { FirstPersonView } from './fpv';
+import { opticForPostType, opticForMount, humanOptic, OPTICS } from './opticProfile';
+import { TrackBook } from './tracking';
+import { FireSupport } from './fireSupport';
+import { FlareLayer } from './flareLayer';
+import { spotrepFilename } from './spotrep';
+import { WatchRoom, watchAssetsOf, watchOpts } from './watchRoom';
+import { DroneFleet, PAYLOAD_SPEC } from './droneFleet';
+import { offlineSet, powerBalance } from './powerGrid';
+import { ManagePanel } from './managePanel';
+import { isOnStation, orbitPoint } from './droneModel';
+import { describeGap, routeCoverage } from './watchEngine';
+import { PlacementManager, FACILITY_CATALOG, fmtKrw, createRecommendedZoneDimensions, computeProjectCost, DIFFICULTY_LABELS } from './placement';
+import { diagnoseSite } from './siteDiagnostics';
+import { prepareRoutes, clearRoutes, InfilSim, allRouteData, routeFeasible, installTerrainModelAxisResolver, setActiveTerrain } from './infiltration';
+import { RouteSketch } from './routeSketch';
+import { IPB } from './ipb';
+import {
+  boundsAround as intelBoundsAround,
+  loadLayers as loadIntelLayers,
+  clearLayers as clearIntelLayers,
+  runAnalysis as runIntelAnalysis,
+  probeVworldData,
+  clearAnalysis as clearIntelAnalysis,
+} from './terrainIntel';
+import { LayerManager, BASEMAPS, OVERLAYS, TERRAINS } from './layers';
+import { setTerrainMode, TERRAIN_MODES } from './terrainfx';
+import { WeatherFx } from './weatherFx';
+import { EnvironmentAudio } from './environmentAudio';
+import { MeasureTool, drawProfileChart } from './measure';
+import { WalkController, DroneCam } from './walk';
+import { ASSET_CATALOG, AssetLayer, WEAPON_IDS, fireMission, degToMils } from './assets';
+import { toMGRS } from './mgrs';
+import { SitePlanStore } from './sitePlan';
+import { sessionRegistry } from './sessionRegistry';
+import { normalizePlanSnapshot, validatePlanSnapshot, PLAN_SCHEMA, PLAN_SCHEMA_VERSION } from '../domain/planContract';
+import { renderBlueprint, downloadBlueprint } from './blueprint';
+import { MgrsGrid } from './mgrsGrid';
+import { initMapChrome } from './mapChrome';
+import { CommandPalette } from './palette';
+import { initShortcutHelp, SHORTCUT_GROUPS } from './shortcuts';
+import { CoaSketch, COA_TOOLS } from './coaSketch';
+import { Briefing } from './briefing';
+import { buildOpReportHtml, computeDecisionTimeline, openOpReport } from './opReport';
+import { judgeAll, paintJudgement, drawAarChart } from './wargame';
+import { RealTerrainModel } from './realTerrain';
+import { SiteWorks } from './siteWorks';
+import {
+  requestDesignTurn, createDesignSystemPrompt, GREETING, QUESTION_BANK, findQuestion,
+  applyQuestionAnswer, mergeTurnRequirements, isInterrogativeText, generatePlacement,
+  parseOffline, AiPlacementError, MODULE_LABELS, UNIT_TEMPLATE_LABELS,
+} from './aiPlace';
+import { clearCache as clearViewshedCache } from './viewshed';
+import { offset, distM, azimuthDeg, azDelta } from './geo';
+import { fireDecision } from './fires';
+import { GP_SCALE_PROFILES, ThreatRingLayer } from './threatRings';
+import { loadRoadInfo, clearRoadInfo, cachedRoadInfo } from './roads';
+import { renderFiresTab } from './firesTab';
+import { strikeReassess, strikeSetActive } from './strikeTab';
+import { renderDecisionTab } from './decisionTab';
+import { renderForecastTab } from './forecastTab';
+import { buildInputs as buildDecisionInputs, runAll as runAllDecisions } from './decision';
+import {
+  buildEvalPayload, generateEvalReport, listOllamaModels, warmModel, EvalReportError,
+} from './evalReport';
+import { renderEvalReport, showEvalPanel, hideEvalPanel, setEvalStage } from './evalPanel';
+import { findObservationPost, GapClosureLayer } from './gapClosure';
+import { MOUNTS } from './sensorModels';
+import { EnvironmentController, renderEnvironmentPanel, refreshEnvironmentPanel } from './environment';
+import { installRenderGuard } from './renderGuard';
+import { QUALITY_PRESETS, applyQuality, savedQualityId, startFpsMeter } from './renderQuality';
+import { OLLAMA_MODEL } from './config';
+import { sampleTerrainDetailed } from './terrainSample';
+import { DEFAULT_MISSION_SCENARIO, missionFingerprint, normalizeMissionScenario } from '../domain/missionContract';
+import { TrainingEvidenceLayer } from './trainingEvidence';
+
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => [...document.querySelectorAll(s)];
+const EOK = 100_000_000;
+
+// ───────────── 상태 ─────────────
+const state = {
+  viewer: null, ents: null, fpv: null, placer: null, infil: null, ipb: null,
+  layers: null, weather: null, measure: null,
+  walk: null, drone: null, assets: null, realTerrain: null, siteWorks: null,
+  terrainMode: 'none',
+  env: null,
+  // 1인칭 관측점 — 선택 상태와, 관측점별로 운용자가 맞춰 둔 관측고
+  fpvSel: 'tower',
+  fpvHeights: new Map(),
+  customVantages: [],
+  pickingVantage: false,
+  grid: null, gridHeight: null,
+  overlayLayer: null,
+  playing: false,
+  dragSpecId: null,
+  buildingDrag: null,
+  dragPostType: null,     // 팔레트에서 끌고 있는 감시자산 유형
+  postPickType: null,     // 클릭 배치 모드 (null = 꺼짐)
+  postDrag: null,         // 지도에서 끌고 있는 초소
+  compareSlot: null,      // 현재 배치와 나란히 비교 중인 계획안 이름
+  coveragePct: null,      // 책임구역 대비 타워 관측 가능 비율 (%)
+  lastPlacement: null,    // 최근 AI 배치 산출물 (Scaffolda generatePlacement)
+  training: null,         // 합성 KCTC/Warrior Platform 근거 레이어 + 시설 소요 도출
+  tracks: new TrackBook(),      // 관측된 것에 붙는 항적 번호 (T01…)
+  fireSupport: new FireSupport(), // 조명 지원 — 「자산이 있다」가 아니라 「지금 떠 있다」
+  spotrep: null,                // 마지막 관측보고 (PNG + 보고문)
+  watch: null,                  // 상시 감시 — 내가 보지 않아도 자산은 판정한다
+  fleet: null,                  // 드론 편대 — 체공은 유한하다
+  power: null,                  // 전원 수지 — 「몇 개를 켤 수 있나」
+  powerOff: new Set(),          // 전원 차단된 자산 uid
+  manage: null,                 // 자산·편대 관리 팝업
+  pickPatrolUid: null,          // 지도에서 순찰 중심을 찍는 중인 기체
+  routeCover: null,             // 시간축 감시 공백 분석 결과
+  covEngine: null,        // CoverageEngine (LOS 마스크 캐시)
+  postCovLayer: null,     // 합동 커버 드레이프
+  mission: normalizeMissionScenario(DEFAULT_MISSION_SCENARIO),
+};
+
+const towerCostEok = (h) => h * 0.55; // 감시탑 억원/m (방호 마운트 포함, 합성 단가)
+
+function toast(msg, ms = 2800) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove('show'), ms);
+}
+function setLoading(show, text) {
+  $('#loading-overlay').classList.toggle('hidden', !show);
+  if (text) $('#loading-text').textContent = text;
+}
+
+/**
+ * 되돌리기 어려운 버튼은 두 번 눌러야 한다.
+ *
+ * 「전체 철거」·「계획 초기화」는 한 번의 오클릭으로 몇 시간 치 작업을 지운다.
+ * 그렇다고 브라우저 confirm() 을 띄우면 Cesium 렌더 루프가 그 동안 멈춰 화면이 얼어붙는다.
+ * 그래서 버튼 자신을 잠깐 「무장」시킨다 — 라벨은 그대로 두고(레이아웃 불변) 색과 맥박,
+ * 그리고 토스트로 알린 뒤 4초 안에 다시 누르면 실행한다.
+ */
+function armDestructive(btn, message, run) {
+  if (!btn) return;
+  let timer = null;
+  const disarm = () => { clearTimeout(timer); timer = null; btn.classList.remove('armed'); };
+  btn.onclick = () => {
+    if (timer) { disarm(); run(); return; }
+    btn.classList.add('armed');
+    timer = setTimeout(disarm, 4000);
+    toast(`${message} — 4초 안에 한 번 더 누르면 실행합니다`, 4000);
+  };
+}
+
+/** 측정 도구는 「지금 무슨 모드인가」가 패널에서 보여야 한다 — 안내 토스트는 곧 사라진다. */
+function syncMeasureButtons(mode) {
+  const map = { distance: '#m-dist', profile: '#m-prof', area: '#m-area' };
+  for (const [id, sel] of Object.entries(map)) {
+    $(sel)?.classList.toggle('primary', mode === id);
+  }
+}
+
+function totalCostKrw() {
+  return state.placer.totalKrw() + towerCostEok(state.ents.towerHeight) * EOK;
+}
+
+function updateHud() {
+  const h = state.ents.towerHeight;
+  const feas = allRouteData().length
+    ? Object.values(MOVE_MODES).map((m) => `${m.icon}${allRouteData().filter((rd) => routeFeasible(rd, m.id)).length}`).join(' ')
+    : '—';
+  $('#hud-metrics').innerHTML = `
+    <div class="hud-card"><div class="h-title">감시탑</div>
+      <div class="h-val">${h}m</div>
+      <div class="h-sub">관측고 ${Math.round(state.ents.groundH + h + 2)}m${state.grid ? ` · 가시격자 탑${state.gridHeight}m` : ''}</div></div>
+    <div class="hud-card"><div class="h-title">공사비 (타워+${state.placer.items.length}동)</div>
+      <div class="h-val" style="color:var(--accent)">${fmtKrw(totalCostKrw())}</div>
+      <div class="h-sub">타워 ${towerCostEok(h).toFixed(1)}억 · 건물 ${fmtKrw(state.placer.totalKrw())}</div></div>
+    <div class="hud-card"><div class="h-title">기동가능 축선</div>
+      <div class="h-val" style="font-size:15px">${feas}</div>
+      <div class="h-sub">도보/구보/차량 · P95 경사 판정</div></div>`;
+}
+
+/**
+ * 책임구역에서 감시탑이 실제로 보는 비율 — 보고서·LLM 평가가 「관측 커버리지」로 읽는 값.
+ * 격자를 새로 구울 때마다 갱신한다(격자가 곧 근거이므로 따로 캐시하지 않는다).
+ */
+function refreshCoveragePct() {
+  if (!state.grid) { state.coveragePct = null; return null; }
+  try {
+    state.coveragePct = Math.round(sectorCoverage(state.grid, [], SITE.sector).visible * 100);
+  } catch (error) {
+    console.warn('[coverage] 커버리지 산출 실패', error);
+    state.coveragePct = null;
+  }
+  return state.coveragePct;
+}
+
+async function ensureGrid(force = false) {
+  const h = state.ents.towerHeight;
+  if (!force && state.grid && state.gridHeight === h) {
+    if (state.coveragePct == null) refreshCoveragePct();
+    return state.grid;
+  }
+  setLoading(true, `감시탑 ${h}m 가시영역 광선추적…`);
+  state.grid = await computeViewshed(state.viewer, {
+    lon: SITE.gp.lon, lat: SITE.gp.lat, eyeH: h + 3,
+    nAz: 144, nR: 64, maxR: 5000,
+    onProgress: (p) => { $('#loading-text').textContent = `가시영역 계산 ${(p * 100).toFixed(0)}%`; },
+    realTerrain: state.realTerrain,
+  });
+  state.gridHeight = h;
+  refreshCoveragePct();
+  setLoading(false);
+  state.infil.setGrid(state.grid);
+  updateHud();
+  if ($('#page-twin').classList.contains('active')) renderTwinTab(); // 자산 커버리지 % 갱신
+  return state.grid;
+}
+
+function drawViewshedOverlay() {
+  if (state.overlayLayer) { state.viewer.imageryLayers.remove(state.overlayLayer, true); state.overlayLayer = null; }
+  if (!state.grid) return;
+  const { canvas, rectangle } = rasterize(state.grid, [], SITE.sector, 'terrain');
+  state.overlayLayer = state.viewer.imageryLayers.addImageryProvider(
+    new Cesium.SingleTileImageryProvider({ url: canvas.toDataURL(), rectangle, tileWidth: canvas.width, tileHeight: canvas.height }),
+  );
+  const el = $('#map-legend');
+  el.innerHTML = `<div class="lg-head">지형 가시성 · 탑 ${state.gridHeight}m</div>
+    <div class="lg-body">
+      <div class="lg-row"><span class="lg-sw" style="background:rgba(52,222,150,.85)"></span>타워에서 관측 가능</div>
+      <div class="lg-row"><span class="lg-sw" style="background:rgba(225,56,72,.8)"></span>지형 차폐 (사각)</div>
+      <div class="lg-row" style="color:var(--muted)">곡률·굴절 k=0.13 · 표적고 1.7m</div>
+    </div>`;
+  el.classList.remove('hidden');
+}
+function clearOverlay() {
+  for (const k of ['overlayLayer', 'covLayer', 'postCovLayer']) {
+    if (state[k]) { state.viewer.imageryLayers.remove(state[k], true); state[k] = null; }
+  }
+  $('#map-legend').classList.add('hidden');
+}
+
+/**
+ * 배치 감시자산 합동 커버 드레이프 — 「어디까지 보이는가」를 지도 위에 얹는다.
+ * 범례에 청천 대비 손실을 같이 적어야 드레이프가 날씨와 묶여 읽힌다.
+ */
+function drawPostCoverage(engine, scored, summary) {
+  for (const k of ['postCovLayer', 'covLayer', 'overlayLayer']) {
+    if (state[k]) { state.viewer.imageryLayers.remove(state[k], true); state[k] = null; }
+  }
+  const { canvas, rectangle } = engine.raster(scored);
+  state.postCovLayer = state.viewer.imageryLayers.addImageryProvider(
+    new Cesium.SingleTileImageryProvider({
+      url: canvas.toDataURL(), rectangle, tileWidth: canvas.width, tileHeight: canvas.height,
+    }),
+  );
+  const env = state.env?.state;
+  const el = $('#map-legend');
+  el.innerHTML = `<div class="lg-head">감시자산 합동 커버 ${Math.round(summary.joint * 100)}%
+    <span style="color:var(--muted)">· ${summary.nPosts}개소</span></div>
+    <div class="lg-body">
+      <div class="lg-row"><span class="lg-sw" style="background:rgba(34,214,238,.85)"></span>고밀 (P≥0.65)</div>
+      <div class="lg-row"><span class="lg-sw" style="background:rgba(61,214,140,.8)"></span>커버 (P≥0.35)</div>
+      <div class="lg-row"><span class="lg-sw" style="background:rgba(252,196,48,.8)"></span>희박 (P≥0.12)</div>
+      <div class="lg-row"><span class="lg-sw" style="background:rgba(225,52,68,.8)"></span>사각</div>
+      <div class="lg-row" style="color:var(--muted)">${env
+        ? `${env.weather.label} · V ${fmtRange(env.weather.visibilityMeters)} 기준 실효거리 반영`
+        : '청천 기준'}</div>
+    </div>`;
+  el.classList.remove('hidden');
+}
+
+/** 합동 커버리지 드레이프 — 자산 최적화 결과 시각화 (가시영역 드레이프와 겹침 방지) */
+function drawCoverageOverlay(placements, report) {
+  if (state.covLayer) { state.viewer.imageryLayers.remove(state.covLayer, true); state.covLayer = null; }
+  if (state.overlayLayer) { state.viewer.imageryLayers.remove(state.overlayLayer, true); state.overlayLayer = null; }
+  if (!state.grid) return;
+  const { canvas, rectangle } = coverageRaster(state.grid, placements);
+  state.covLayer = state.viewer.imageryLayers.addImageryProvider(
+    new Cesium.SingleTileImageryProvider({ url: canvas.toDataURL(), rectangle, tileWidth: canvas.width, tileHeight: canvas.height }),
+  );
+  const el = $('#map-legend');
+  el.innerHTML = `<div class="lg-head">합동 센서·화기 커버 ${Math.round(report.jointAfter * 100)}%</div>
+    <div class="lg-body">
+      <div class="lg-row"><span class="lg-sw" style="background:rgba(34,214,238,.85)"></span>고밀 커버 (P≥0.6)</div>
+      <div class="lg-row"><span class="lg-sw" style="background:rgba(61,214,140,.8)"></span>커버 (P≥0.3)</div>
+      <div class="lg-row"><span class="lg-sw" style="background:rgba(252,196,48,.8)"></span>희박</div>
+      <div class="lg-row"><span class="lg-sw" style="background:rgba(225,52,68,.8)"></span>미커버 사각</div>
+      <div class="lg-row" style="color:var(--muted)">탐지확률 합성 1−∏(1−Pᵢ) · 곡률 k=0.13</div>
+    </div>`;
+  el.classList.remove('hidden');
+}
+
+// ═════════════ 1인칭 관측점 (vantage) ═════════════
+/**
+ * 1인칭은 큰 개념이고 관측점은 그 안의 선택지다 — 감시탑은 그 중 하나일 뿐이다.
+ *
+ * 여기서 하는 일은 「지금 이 계획 위에서 사람이 눈을 둘 수 있는 자리」를 한 목록으로
+ * 모으는 것 뿐이다. 자리마다 지반고·관측고·초기 지향이 다르고, 들어갈 때 걷어내야
+ * 하는 것(타워 캐빈 유리, 건물 벽체)도 다르므로 그 처리는 관측점이 스스로 들고 있다.
+ * FirstPersonView 는 이 계약만 알고 종류는 모른다.
+ */
+const FLOOR_H = 3.2;            // buildingModels 층고
+const EYE_ON_FLOOR = 1.2;       // 층 바닥에서 총안구/창까지
+const VANTAGE_ICON = { tower: svgIcon('tower'), post: svgIcon('hut'), facility: svgIcon('ruin'), asset: svgIcon('antenna'), point: svgIcon('pin') };
+// 자산 거치대 관측고 — sensorModels 실물 모델의 데크/센서 높이
+const ASSET_EYE_H = { eo: 8, ir: 8, radar: 4.2, acoustic: 2.4, cuas: 5.2, flare: 2.0, weapon: 1.4 };
+const ASSET_NAME = {
+  eo: 'EO 카메라 마스트', ir: 'IR 카메라 마스트', radar: '감시레이더 트레일러',
+  acoustic: '음향 어레이', cuas: '대드론 재머', flare: '조명탄 발사대', weapon: '중화기 진지',
+};
+
+/** 운용자가 그 관측점에서 맞춰 둔 관측고를 기억한다 (없으면 기본값). */
+const vantageH = (id, fallback) => state.fpvHeights.get(id) ?? fallback;
+const rememberH = (id, h) => { state.fpvHeights.set(id, h); };
+
+function towerVantage() {
+  return {
+    id: 'tower', kind: 'tower',
+    name: '주감시탑 (GP-107)',
+    sub: `지반 ${Math.round(state.ents.groundH)}m · 탑고 ${state.ents.towerHeight}m · ${towerCostEok(state.ents.towerHeight).toFixed(1)}억`,
+    lon: SITE.gp.lon, lat: SITE.gp.lat,
+    groundH: state.ents.groundH,
+    height: state.ents.towerHeight,
+    adjustable: true, minH: 6, maxH: 40,
+    heightLabel: '감시탑 높이',
+    setHeight: (h) => setTowerHeight(h),
+    costText: (h) => `타워 ${towerCostEok(h).toFixed(1)}억`,
+    headingDeg: SITE.sector.centerAz,
+    tag: 'GP-107',
+    // 감시탑 관측반은 맨눈으로 훑고 쌍안경으로 확인한다 — B 로 오간다
+    optic: OPTICS.bino,
+    // 승탑 중엔 캐빈 유리·벽이 시야를 가리므로 자기 몸체를 숨긴다
+    onEnter: () => state.ents.tower?.setVisible(false),
+    onExit: () => state.ents.tower?.setVisible(true),
+  };
+}
+
+function postVantage() {
+  const r = state.gapClosure;
+  if (!r?.ok) return null;
+  const p = r.post;
+  const id = 'post';
+  return {
+    id, kind: 'post',
+    name: '부감시소 (권고)',
+    sub: `표고 ${p.elevationM}m · ${r.route.name.split(' — ')[0]} 커버 ${r.coverage.beforePercent}% → ${r.coverage.afterPercent}%`,
+    lon: p.lon, lat: p.lat,
+    groundH: p.groundH,
+    height: vantageH(id, r.postHeightM),
+    adjustable: true, minH: 3, maxH: 30,
+    heightLabel: '초소 관측고',
+    setHeight: (h) => rememberH(id, h),
+    headingDeg: azimuthDeg(p.lon, p.lat, SITE.gp.lon, SITE.gp.lat + 0.03),
+    tag: 'OP-2',
+    optic: OPTICS.bino,
+  };
+}
+
+function facilityVantages() {
+  return (state.placer?.items ?? []).map((it) => {
+    const floors = Math.max(1, it.floors ?? it.spec.floors ?? 1);
+    const id = `fac:${it.uid}`;
+    const topEye = (floors - 1) * FLOOR_H + EYE_ON_FLOOR;
+    const height = vantageH(id, topEye);
+    const floorOf = Math.min(floors, Math.max(1, Math.round((height - EYE_ON_FLOOR) / FLOOR_H) + 1));
+    return {
+      id, kind: 'facility',
+      name: it.spec.name,
+      sub: `${floorOf}층/${floors}층 · 총안구 관측고 ${Math.round(height)}m · 지반 ${Math.round(it.groundH)}m`,
+      lon: it.lon, lat: it.lat,
+      groundH: it.groundH,
+      height,
+      adjustable: floors > 1,
+      minH: EYE_ON_FLOOR, maxH: Math.max(topEye, EYE_ON_FLOOR + 1),
+      heightLabel: '층 관측고',
+      setHeight: (h) => rememberH(id, h),
+      headingDeg: SITE.sector.centerAz,
+      tag: `F${floorOf}`,
+      // 총안구 뒤에 선 사람 — 맨눈에서 시작한다
+      optic: humanOptic(),
+      // 안에서 밖을 보려면 껍데기를 걷어야 한다 (도보 내부 진입과 같은 처리)
+      onEnter: () => state.placer.setShellVisible(it.uid),
+      onExit: () => state.placer.setShellVisible(null),
+    };
+  });
+}
+
+function assetVantages() {
+  const heights = state.assets?.mounts?.heights;
+  if (!heights) return [];
+  // sensorModels.sync 와 같은 규약 — 화기 4종은 중화기 진지 1기를 공유한다.
+  const keys = new Set();
+  for (const id of state.assets.active) {
+    if (WEAPON_IDS.includes(id)) keys.add('weapon');
+    else if (MOUNTS[id]) keys.add(id);
+  }
+  return [...keys]
+    .map((key) => {
+      const m = MOUNTS[key];
+      const p = offset(SITE.gp.lon, SITE.gp.lat, m.az, m.dist);
+      const id = `asset:${key}`;
+      const eye = ASSET_EYE_H[key] ?? 3;
+      return {
+        id, kind: 'asset',
+        name: ASSET_NAME[key] ?? key,
+        sub: `GP ${Math.round(m.az)}°/${m.dist}m · 지향 ${Math.round(m.aimAz ?? m.heading())}° · 관측고 ${eye}m`,
+        lon: p.lon, lat: p.lat,
+        groundH: heights.get(key) ?? state.ents.groundH,
+        height: vantageH(id, eye),
+        adjustable: true, minH: 1, maxH: 20,
+        heightLabel: '거치 관측고',
+        setHeight: (h) => rememberH(id, h),
+        headingDeg: m.aimAz ?? m.heading(),
+        tag: key.toUpperCase(),
+        // 이 자리에서 보는 눈은 사람 눈이 아니라 그 장비의 눈이다
+        optic: opticForMount(key),
+        feedSource: { kind: 'post', uid: key },
+      };
+    });
+}
+
+/** 직접 배치한 감시초소 — 마스트 꼭대기가 곧 관측점이다. */
+function sensorPostVantages() {
+  // 발전기는 서서 볼 자리가 아니다 — 관측점 목록에 넣으면 「1인칭 진입」이 헛돈다
+  return (state.posts?.list() ?? []).filter((p) => !POST_TYPE[p.type]?.genW).map((p) => {
+    const t = POST_TYPE[p.type];
+    const id = `post:${p.uid}`;
+    const perf = state.posts.perfOf(p);
+    return {
+      id, kind: 'asset',
+      name: `${t.icon} ${p.name} (${t.short})`,
+      sub: `GP ${Math.round(azimuthDeg(SITE.gp.lon, SITE.gp.lat, p.lon, p.lat))}°/`
+        + `${Math.round(distM(SITE.gp.lon, SITE.gp.lat, p.lon, p.lat))}m · 지향 ${Math.round(p.aimAz)}°`
+        + ` · 실효 ${fmtRange(perf.range)}`,
+      lon: p.lon, lat: p.lat,
+      groundH: p.groundH,
+      height: vantageH(id, p.mastH),
+      adjustable: true, minH: t.mast[1], maxH: t.mast[2],
+      heightLabel: '마스트 관측고',
+      setHeight: (h) => { rememberH(id, h); state.posts.update(p.uid, { mastH: h }); },
+      headingDeg: p.aimAz,
+      tag: `${t.short}-${p.uid.replace('sp', '')}`,
+      optic: opticForPostType(p.type),
+      feedSource: t.feed === 'none' ? null : { kind: 'post', uid: p.uid },
+    };
+  });
+}
+
+function customVantages() {
+  return state.customVantages.map((c) => ({
+    id: c.id, kind: 'point',
+    name: c.name,
+    sub: `${toMGRS(c.lon, c.lat)} · 지반 ${Math.round(c.groundH)}m`,
+    lon: c.lon, lat: c.lat,
+    groundH: c.groundH,
+    height: vantageH(c.id, c.height),
+    adjustable: true, minH: 1.6, maxH: 40,
+    heightLabel: '가설 관측고',
+    setHeight: (h) => rememberH(c.id, h),
+    headingDeg: azimuthDeg(c.lon, c.lat, SITE.gp.lon, SITE.gp.lat + 0.03),
+    tag: 'PT',
+    optic: humanOptic(),
+  }));
+}
+
+function listVantages() {
+  return [towerVantage(), postVantage(), ...customVantages(), ...facilityVantages(),
+    ...assetVantages(), ...sensorPostVantages()].filter(Boolean);
+}
+
+function getVantage(id) {
+  return listVantages().find((v) => v.id === id) ?? null;
+}
+
+/** 어느 관측점이든 같은 문. 도보/드론과는 배타적이다. */
+function enterFpv(id) {
+  const v = getVantage(id ?? state.fpvSel);
+  if (!v) { toast('진입할 관측점이 없습니다'); return; }
+  state.fpvSel = v.id;
+  if (state.walk.active) state.walk.exitSilent();
+  if (state.drone.active) state.drone.exit();
+  state.fpv.enter(v);
+  toast(`1인칭 — ${v.name}`, 2600);
+  if ($('#page-twin').classList.contains('active')) renderVantageList();
+}
+
+/** 지도에서 임의 지점을 관측점으로 세운다 — 「어디 초소에서도」의 그 어디. */
+function beginVantagePick() {
+  state.pickingVantage = true;
+  $('#pick-vantage')?.classList.add('primary');
+  toast('지도에서 관측점으로 쓸 지점을 클릭하세요 (ESC 취소)', 4200);
+}
+
+/** 순찰 지점 지정 취소 — ESC 로 빠져나올 수 없는 모드는 함정이다. */
+function cancelPatrolPick() {
+  if (!state.pickPatrolUid) return false;
+  state.pickPatrolUid = null;
+  state.manage?.refresh();
+  toast('순찰 지점 지정 취소', 2000);
+  return true;
+}
+
+function cancelVantagePick() {
+  if (!state.pickingVantage) return;
+  state.pickingVantage = false;
+  $('#pick-vantage')?.classList.remove('primary');
+}
+
+async function addCustomVantage(lon, lat) {
+  const carto = [Cesium.Cartographic.fromDegrees(lon, lat)];
+  try { await sampleTerrainDetailed(state.viewer.terrainProvider, carto); } catch (e) { console.warn(e); }
+  const groundH = carto[0].height ?? state.ents.groundH;
+  const n = state.customVantages.length + 1;
+  const v = { id: `pt:${n}-${Math.round(lon * 1e5)}`, name: `가설 관측점 ${n}`, lon, lat, groundH, height: 6 };
+  state.customVantages.push(v);
+  state.fpvSel = v.id;
+  if ($('#page-twin').classList.contains('active')) renderVantageList();
+  if (state.fpv.active) renderFpvSwitch();
+  toast(`관측점 추가 — ${toMGRS(lon, lat)} 지반 ${Math.round(groundH)}m`, 3200);
+  return v;
+}
+
+function renderVantageList() {
+  const el = $('#vantage-list');
+  if (!el) return;
+  // 1인칭 안에서는 이 목록과 지도 위 HUD 칩이 같은 일을 한다 — 처음 보면 중복으로
+  // 읽히니, 지금 그 상태라고 한 줄로 알려 준다(목록 자체는 지우지 않는다: ▶ 로도 전환된다).
+  $('#vantage-fpv-hint')?.classList.toggle('hidden', !state.fpv?.active);
+  const list = listVantages();
+  if (!list.some((v) => v.id === state.fpvSel)) state.fpvSel = list[0]?.id ?? null;
+  el.innerHTML = list.map((v) => {
+    const o = v.optic ?? humanOptic();
+    return `
+    <div class="vantage ${v.id === state.fpvSel ? 'selected' : ''}" data-vt="${v.id}">
+      <span class="vt-icon">${VANTAGE_ICON[v.kind] ?? svgIcon('pin')}</span>
+      <span class="vt-body"><b>${v.name}</b><em>${v.sub ?? ''}</em></span>
+      <span class="vt-optic" style="color:${o.color};border-color:${o.color}"
+        title="${o.name} — ×1 시야각 ${o.fov0}° · 배율단 ${o.zooms.map((z) => `×${z}`).join('/')}">${o.short}</span>
+      <button class="vt-go" data-vtgo="${v.id}" title="이 자산의 눈으로 보기">▶</button>
+    </div>`;
+  }).join('');
+  $$('#vantage-list [data-vt]').forEach((row) => {
+    row.onclick = (e) => {
+      if (e.target.closest('[data-vtgo]')) return;
+      state.fpvSel = row.dataset.vt;
+      renderVantageList();
+    };
+  });
+  $$('#vantage-list [data-vtgo]').forEach((b) => {
+    b.onclick = () => { cancelTour(); enterFpv(b.dataset.vtgo); };
+  });
+}
+
+/** 승탑 중에도 관측점을 갈아탈 수 있어야 한다 — 그래야 「1인칭이 큰 개념」이 된다. */
+function renderFpvSwitch() {
+  const el = $('#fpv-switch');
+  if (!el) return;
+  const cur = state.fpv?.vantage?.id;
+  el.innerHTML = listVantages().map((v) => `
+    <button class="fpv-chip ${v.id === cur ? 'is-active' : ''}" data-fpvsw="${v.id}"
+      title="${v.sub ?? ''}">${VANTAGE_ICON[v.kind] ?? svgIcon('pin')} ${v.name}</button>`).join('');
+  el.querySelectorAll('[data-fpvsw]').forEach((b) => {
+    b.onclick = () => enterFpv(b.dataset.fpvsw);
+  });
+}
+
+/** 환경 프리셋 — 모델 입력만 바꾸고 하늘·조도·안개·영향은 모델이 계산한다. GIS 탭에만 마운트된다. */
+function renderEnvPresets(sel) {
+  const el = $(sel);
+  if (!el) return;
+  el.innerHTML = ENV_PRESETS.map((p) => `
+    <button class="btn" data-envpreset="${p.id}" style="flex:1 1 30%">${p.name}</button>`).join('');
+  el.querySelectorAll('[data-envpreset]').forEach((b) => {
+    b.onclick = () => {
+      const preset = ENV_PRESETS.find((p) => p.id === b.dataset.envpreset);
+      state.env.set(preset.patch);
+      renderEnvSummary();
+      renderEnvironmentPanel($('#env-mount-gis'), state.env);
+      toast(`환경: ${preset.name} — ${state.env.headline()}`, 3600);
+    };
+  });
+}
+
+
+/**
+ * 전원 수지를 다시 푼다.
+ *
+ * 자산이 늘거나 발전기가 서거나 기온이 떨어지면 결과가 바뀌고, 그 결과가 곧
+ * **어느 자산이 꺼지는가**다. 그래서 배치·환경이 바뀌는 모든 지점에서 부른다.
+ */
+function recomputePower() {
+  const posts = state.posts?.list() ?? [];
+  const assets = posts
+    .filter((p) => (POST_TYPE[p.type]?.powerW ?? 0) > 0)
+    .map((p) => {
+      const t = POST_TYPE[p.type];
+      return { uid: p.uid, name: p.name, short: t.short, powerW: t.powerW, priority: t.powerPri ?? 2 };
+    });
+  const gens = posts
+    .filter((p) => POST_TYPE[p.type]?.genW)
+    .map((p) => {
+      const t = POST_TYPE[p.type];
+      return {
+        uid: p.uid, name: p.name, capacityW: t.genW, fuelL: t.fuelL,
+        idleLph: t.idleLph, fullLph: t.fullLph, running: p.running !== false,
+      };
+    });
+  const bal = powerBalance(assets, gens, { tempC: state.env?.state?.temperatureC ?? 15 });
+  const before = state.powerOff;
+  state.power = bal;
+  state.powerOff = offlineSet(bal);
+  // 차단 상태가 바뀌면 부채꼴·목록·감시가 전부 달라진다
+  const changed = before.size !== state.powerOff.size
+    || [...state.powerOff].some((u) => !before.has(u));
+  if (changed) {
+    state.posts?.redraw();
+    state.watchTab?.refresh();
+    state.manage?.refresh();
+  }
+  return bal;
+}
+
+/**
+ * 상시 감시 로그 표출.
+ *
+ * 행 하나가 「언제 · 무엇을 · 어느 자산이 · 어떤 등급으로」다. 눌러서 그 자산의
+ * 화면을 열 수 있어야 로그가 읽는 것에서 그치지 않는다.
+ */
+function renderWatchLog(log) {
+  const box = $('#watch-log');
+  const rows = $('#wg-rows');
+  if (!box || !rows) return;
+  box.classList.toggle('hidden', !log.length && !state.watch?.everSeen.size);
+  // 로그는 **검토용**이지 늘 켜 두는 계기가 아니다 — 접힌 채로 시작하고,
+  // 새 사건이 오면 접힌 머리띠가 한 번 뛴다. 펼치는 것은 사람이 정한다.
+  if (!box.dataset.init) {
+    box.dataset.init = '1';
+    box.classList.add('collapsed');
+  }
+  const grew = log.length > (+box.dataset.n || 0);
+  box.dataset.n = String(log.length);
+  if (grew && box.classList.contains('collapsed')) {
+    box.classList.remove('ping');
+    void box.offsetWidth;          // 애니메이션 재시작
+    box.classList.add('ping');
+  }
+  $('#wg-count').textContent = String(log.length);
+  if (!log.length) {
+    rows.innerHTML = '<div class="wg-empty">아직 접촉 없음 — 배치된 자산이 계속 판정 중입니다.'
+      + '<br>침투 탭에서 리허설을 재생하면 사건이 여기 쌓입니다.</div>';
+    return;
+  }
+  rows.innerHTML = log.slice(0, 24).map((e, i) => `
+    <div class="wg-row" data-log="${i}">
+      <span class="wg-t">${e.dtg}</span>
+      <span class="wg-what">${e.name}${e.assetName ? ` · ${e.assetName}` : ''}</span>
+      <span class="wg-kind" style="color:${e.color}">${e.label}</span>
+      <span class="wg-sub">${e.grade ? `${e.grade} ` : ''}${
+        e.distM != null ? `${Math.round(e.distM)}m` : ''}${
+        e.pd != null ? ` · Pd ${e.pd.toFixed(2)}` : ''}${
+        e.holders ? ` · ${e.holders}개 자산 접촉` : ''}</span>
+    </div>`).join('');
+  $$('#wg-rows [data-log]').forEach((row) => {
+    row.onclick = () => {
+      const e = log[+row.dataset.log];
+      if (e?.assetUid) state.sensorFeed?.open({ kind: 'post', uid: e.assetUid });
+    };
+  });
+}
+
+/**
+ * 이 기체의 짐벌로 들어간다.
+ *
+ * 드론 시점은 「어딘가의 드론」이 아니라 **이 기체**여야 한다 — 편대 관리에서
+ * 고른 고도·반경·순찰 중심·페이로드를 그대로 물고 들어가지 않으면, 관리한 것과
+ * 보는 것이 다른 화면이 된다.
+ */
+function enterDroneView(uid) {
+  const d = state.fleet?.get(uid);
+  if (!d) return;
+  if (!isOnStation(d)) { toast(`${d.name} 은 지금 지상에 있습니다 — 먼저 출격시키세요`, 3600); return; }
+  cancelTour();
+  state.fpv.exitSilent();
+  if (state.walk.active) state.walk.exitSilent();
+  state.drone.attachTo(d, state.fleet);
+  state.drone.enter();
+  toast(`${d.name} 짐벌 — ${PAYLOAD_SPEC[d.payload].label} · AGL ${Math.round(d.curAglM)}m`, 4000);
+}
+
+/** 데이터 URL 을 파일로 떨군다 — 보고문과 화면 캡처가 같은 문을 쓴다. */
+function downloadDataUrl(url, filename) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/**
+ * 관측보고 표출.
+ *
+ * 화면 캡처는 **그리는 프레임 안에서** 떠야 한다 — Cesium 은
+ * `preserveDrawingBuffer` 없이 돌기 때문에, 렌더가 끝난 다음 프레임에
+ * `toDataURL()` 을 부르면 빈 캔버스가 나온다. 그래서 `postRender` 한 번을
+ * 빌려 그 안에서 읽고, 그 위에 HUD 캔버스를 겹쳐 한 장으로 만든다.
+ */
+function showSpotrep(rep) {
+  const scene = state.viewer.scene;
+  const compose = () => {
+    let png = null;
+    try {
+      const base = state.viewer.canvas;
+      const out = document.createElement('canvas');
+      out.width = base.width;
+      out.height = base.height;
+      const g = out.getContext('2d');
+      g.drawImage(base, 0, 0);
+      const hud = document.querySelector('#fpv-hud');
+      // HUD 는 CSS 픽셀 기준이라 캔버스 해상도에 맞춰 늘려 겹친다
+      if (hud?.width) g.drawImage(hud, 0, 0, out.width, out.height);
+      png = out.toDataURL('image/png');
+    } catch (e) {
+      console.warn('관측 화면 캡처 실패 — 보고문만 표출', e);
+    }
+    state.spotrep = { ...rep, png, base: spotrepFilename(rep.input) };
+    const img = $('#spot-shot');
+    if (png) { img.src = png; img.style.display = ''; } else { img.removeAttribute('src'); img.style.display = 'none'; }
+    $('#spot-text').textContent = rep.text;
+    $('#spot-title').textContent =
+      `관측보고 — ${rep.input.observer.tag} · ${rep.input.target.trackId ?? '측거점'}`;
+    $('#spot-card').classList.remove('hidden');
+    $('#spot-png').disabled = !png;
+    toast('관측보고 생성 — 화면 PNG · 보고문 TXT 로 내려받을 수 있습니다', 4200);
+  };
+  const remove = scene.postRender.addEventListener(() => { remove(); compose(); });
+}
+
+// ═════════════ ① 트윈 ═════════════
+let _cine = null;
+/**
+ * 시네마틱 투어 — 레터박스·캡션 오버레이 + 골든아워 자동 조명.
+ * 투어 동안 일몰 35분 전(저사양 태양·따뜻한 하늘)·청천으로 잠깐 바꿔 가장 예쁜 빛을 만들고,
+ * 끝나거나 건너뛰면 사용자의 원래 시각·날씨로 되돌린다.
+ */
+function startCinematicTour() {
+  if (!_cine) _cine = new CinematicOverlay('#map-wrap');
+  const env = state.env;
+  let restore = null;
+  if (env) {
+    const st = env.state ?? env.apply();
+    const setMin = st?.daylight?.sunsetMinute;
+    const golden = Number.isFinite(setMin) ? Math.max(0, Math.round(setMin - 35)) : 1080;
+    restore = { minuteOfDay: env.settings.minuteOfDay, weather: env.settings.weather };
+    env.set({ minuteOfDay: golden, weather: 'clear' });
+  }
+  const finish = () => { if (restore && env) { env.set(restore); } restore = null; };
+  _cine.show(() => { cancelTour(); _cine.hide(); finish(); });
+  cinematicTour(
+    state.viewer, SITE.gp, state.ents.groundH, state.ents.towerHeight,
+    (title, meta) => { _cine.stage(title, meta); if (title == null) finish(); },
+  );
+}
+
+function renderTwinTab() {
+  $('#page-twin').innerHTML = `
+    <div class="sec"><div class="sec-title">1인칭 관측</div>
+      <p class="muted" style="margin-bottom:6px"><b>관측점을 하나 고르면 그 자산의 눈이 된다</b> —
+      자리만 옮기는 것이 아니다. 감시탑·부감시소·초소의 층·자산 거치대·지도에서 방금 찍은 한 점까지
+      전부 같은 문으로 들어간다.
+      <br><br><b>화면</b> — TOD 는 열상(백열/흑열 <b>P</b>, 주기적 <b>NUC</b> 셔터), EO 는 야간에
+      <b>야시(I²)</b> 자동 전환, 조준경은 <b>탄도 사다리</b>, 레이더는 <b>PPI 스코프</b>,
+      드론은 <b>비행 계기</b>(고도·속도·배터리·링크). 공통으로 방위 테이프 · 부앙 사다리 ·
+      <b>레이저 측거(L)</b> · 실효거리 막대 · 표적 브래킷 · 평면 미니맵.
+      배율은 연속 줌이 아니라 <b>단</b>으로 넘어간다(휠).
+      <br><br><b>작전 한 바퀴</b> — <b>T</b> 로 표적을 물면 항적 번호가 붙고 속도·진로·<b>GP 도달
+      예상시간</b>이 계산되며 짐벌이 따라간다. <b>C</b> 인계는 볼 수 있는 자산의
+      <b>부채꼴을 실제로 돌리고</b> 화면을 연다. 밤에 EO 가 못 보면 <b>I</b> 로 조명을 올려 32초 동안
+      유효거리를 되살리고, <b>S</b> 로 그 화면 그대로 <b>관측보고(SPOTREP)</b> 를 떨군다.</p>
+      <p class="muted hidden" id="vantage-fpv-hint" style="margin:2px 0 6px">
+        이미 1인칭 안에 있습니다 — 지도 위 HUD의 칩을 눌러도 여기서 골라도 같은 전환입니다.</p>
+      <div id="vantage-list"></div>
+      <div class="btn-row" style="margin-top:6px">
+        <button class="btn primary" id="enter-fpv" style="flex:2">◈ 선택 관측점 1인칭 진입 ▶</button>
+        <button class="btn" id="pick-vantage" style="flex:1">＋ 지도 지정</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="enter-walk">${svgIcon('walk')} 도보 정찰 (WASD)</button>
+        <button class="btn" id="enter-drone">${svgIcon('drone')} 드론 정찰</button>
+      </div>
+      <p class="muted" style="margin-top:4px">도보 중 E: 근처 관측점 승탑·건물 내부 진입(층별 R/Q) — 배치 탭에서 지은 초소 안에 들어가 총안구 시야를 확인.</p>
+      <div class="slider-row" style="margin-top:10px"><label>감시탑 높이</label>
+        <input type="range" id="twin-height" min="6" max="40" step="1" value="${state.ents.towerHeight}">
+        <span class="val" id="twin-height-val">${state.ents.towerHeight}m</span></div>
+      <div class="card" id="twin-cost"></div></div>
+    <div class="sec"><div class="sec-title">가시영역</div>
+      <div class="btn-row">
+        <button class="btn" id="run-viewshed">가시영역 계산·표시 (~10초)</button>
+        <button class="btn" id="clear-viewshed">지우기</button>
+      </div>
+      <p class="muted" style="margin-top:6px">현재 타워 높이 기준 지형 광선추적 — 침투 관측 판정과 NAI/TAI 도출의 근거.</p></div>
+    <div class="sec"><div class="sec-title">카메라</div>
+      <button class="btn full cine-launch" id="fly-tour"><span class="cl-ico">▶</span> 시네마틱 투어 <span class="cl-sub">5-shot 연출 · 레터박스</span></button>
+      <button class="btn full" id="run-brief">${svgIcon('clipboard')} 작전 브리핑 (현 계획 기반)</button>
+      <div class="btn-row">
+        <button class="btn" id="fly-gp">GP 상공</button>
+        <button class="btn" id="fly-north">침투축선 조감</button>
+        <button class="btn" id="fly-hub">후방허브</button>
+      </div></div>
+    <div class="sec"><div class="sec-title">감시·화기 자산 가시거리</div>
+      <p class="muted" style="margin-bottom:4px">가시거리는 하나가 아니다 — 화기 유효사거리 / 카메라 DRI(탐지·인지·식별) /
+      센서 커버 / 대드론 돔을 층위별로 전시. 커버리지 %는 지형 가시영역과의 교집합.</p>
+      <div id="asset-list"></div>
+      <button class="btn full" id="asset-optimize">◈ 자산 배치 최적화 (지형 LOS 탐색) ▶</button>
+      <button class="btn full" id="asset-clear">전체 끄기</button>
+      <p class="muted" id="asset-opt-report" style="margin-top:4px">최적화: GP 주변 72개 후보를 가시영역 그리드로
+      광선추적해 자산별 최적 거치점 산출 — 광학/레이더/화기=섹터 커버 최대, 음향=전방 전진, 조명·재머=고지 확보.</p>
+      <p class="muted" style="margin-top:6px">여기 사거리는 <b>청천 제원</b>이고 GP 기준 층위 전시다.
+      자산을 <b>원하는 자리에 직접 세우고</b> 그 배치가 지금 날씨에서 실제로 어디까지 보는지 —
+      눈·안개가 얼마나 깎는지 — 를 보려면
+      <a href="#" id="goto-watch" style="color:var(--accent)">감시 탭</a>으로.</p></div>
+    <div class="sec"><div class="sec-title">지금 환경</div>
+      <div class="env-summary-line" id="env-summary"></div>
+      <p class="muted" style="margin-top:4px">시각·계절·날씨 조종 패널은 <a href="#" id="goto-env" style="color:var(--accent)">지도 탭</a>
+      한 곳에만 있다 — 모든 탭·1인칭·감시 피드가 같은 환경 상태를 본다.</p></div>`;
+
+  renderVantageList();
+  $('#enter-fpv').onclick = () => { cancelTour(); enterFpv(state.fpvSel); };
+  $('#pick-vantage').onclick = () => beginVantagePick();
+  $('#enter-walk').onclick = () => {
+    cancelTour();
+    state.fpv.exitSilent();
+    if (state.drone.active) state.drone.exit();
+    state.walk.enter();
+    toast('도보 정찰 — WASD 이동 · Shift 질주 · E 타워/건물 진입 · ESC 종료', 4200);
+  };
+  $('#enter-drone').onclick = () => {
+    // 「드론 정찰」은 이제 편대의 **어느 기체**로 들어가는 일이다 — 떠 있는 기체가
+    // 없으면 아무 데서나 카메라가 뜨는 대신 그 사실을 말한다.
+    const flying = state.fleet?.drones.filter(isOnStation) ?? [];
+    if (flying.length) { enterDroneView(flying[0].uid); return; }
+    const ready = state.fleet?.drones.find((d) => d.state === 'READY');
+    if (ready) {
+      state.fleet.launch(ready.uid);
+      toast(`${ready.name} 출격 — 임무 고도 도달 후 시점 진입 가능 (편대 관리에서 「시점」)`, 5200);
+      state.manage?.openFleet();
+      return;
+    }
+    toast('출격 가능한 기체가 없습니다 — 편대 관리에서 드론을 추가하거나 충전을 기다리세요', 4600);
+    state.manage?.openFleet();
+  };
+
+  // 자산 체크리스트 (그룹별 + 커버리지)
+  const groups = [...new Set(ASSET_CATALOG.map((a) => a.group))];
+  $('#asset-list').innerHTML = groups.map((g) => `
+    <div class="asset-group">${g}</div>
+    ${ASSET_CATALOG.filter((a) => a.group === g).map((a) => {
+      const cov = state.grid && (a.kind === 'dri' || a.kind === 'wedge' || a.id === 'acoustic')
+        ? state.assets.coverage(a, state.grid) : null;
+      const rangeTxt = a.kind === 'dri'
+        ? `D${(a.dri[0] / 1000).toFixed(1)}/R${(a.dri[1] / 1000).toFixed(1)}/I${(a.dri[2] / 1000).toFixed(1)}km`
+        : `${fmtRange(a.range)}${a.fov ? '/' + a.fov + '°' : ''}`;
+      return `<div class="layer-row">
+        <span style="color:${a.color}">${a.icon}</span>
+        <span class="l-name">${a.name}</span>
+        <span class="muted" style="font-family:var(--display);font-size:10.5px">${rangeTxt}${cov !== null ? ` · 커버 ${(cov * 100).toFixed(0)}%` : ''}</span>
+        <input type="checkbox" data-asset="${a.id}" ${state.assets.isOn(a.id) ? 'checked' : ''}>
+      </div>`;
+    }).join('')}`).join('');
+  $$('#asset-list [data-asset]').forEach((cb) => {
+    cb.onchange = () => {
+      state.assets.toggle(cb.dataset.asset, cb.checked);
+      renderVantageList();   // 거치대도 관측점이다 — 켜지면 목록에 올라온다
+    };
+  });
+  $('#asset-clear').onclick = () => { state.assets.clearAll(); renderTwinTab(); };
+  $('#asset-optimize').onclick = async () => {
+    await ensureGrid();
+    setLoading(true, '합동 최적화 — 후보 180 × 지향 7 × 표적 234 한계기여 탐색…');
+    try {
+      const { placements, report } = await state.assets.optimizeMounts(state.grid);
+      // UX: 켜진 자산이 하나도 없으면 결과가 안 보인다 — 핵심 3종 자동 표시
+      if (state.assets.active.size === 0) {
+        ['radar', 'eo', 'hmg'].forEach((id) => state.assets.toggle(id, true));
+        renderTwinTab();
+        toast('결과 확인을 위해 레이더·EO·K6를 자동으로 켰습니다', 3600);
+      }
+      const NAME = { eo: 'EO', ir: 'IR', radar: '레이더', acoustic: '음향', cuas: '재머', flare: '조명탄', weapon: '중화기' };
+      const pct = (v) => (v === null ? '—' : `${Math.round(v * 100)}%`);
+      const rows = report.perAsset.map((r) => `
+        <div class="kv" style="font-size:11px"><span>${NAME[r.key] ?? r.key} · 위치 ${r.az}°/${r.dist}m · 지향 ${Math.round(r.aimAz)}°</span>
+        <b>${r.coverage === null ? '고지 확보' : `기여 +${pct(r.marginal)} (단독 ${pct(r.coverage)})`}</b></div>`).join('');
+      const gapsTxt = report.gaps.length
+        ? report.gaps.map((g) => (g.from === g.to ? `${g.from}°` : `${g.from}~${g.to}°`)).join(', ')
+        : '없음';
+      const el = $('#asset-opt-report');
+      if (el) {
+        el.innerHTML = `
+        <b style="color:var(--accent)">합동 커버리지 ${pct(report.jointBefore)} → ${pct(report.jointAfter)}</b>
+        (탐지확률 가중 · 위치×지향 동시 최적화)${rows}
+        <div class="kv" style="font-size:11px"><span>조기경보선(1.8km) 사각 방위</span>
+        <b style="color:${report.gaps.length ? '#ed5d5d' : '#3dd68c'}">${gapsTxt}</b></div>`;
+      }
+      drawCoverageOverlay(placements, report);
+      toast('합동 배치 최적화 완료 — 거치·지향 갱신, 커버리지 드레이프 표시', 5200);
+    } finally { setLoading(false); }
+  };
+  $('#goto-watch')?.addEventListener('click', (e) => { e.preventDefault(); switchTab('watch'); });
+  $('#twin-height').oninput = (e) => setTowerHeight(+e.target.value);
+  $('#run-viewshed').onclick = async () => { await ensureGrid(); drawViewshedOverlay(); };
+  $('#clear-viewshed').onclick = clearOverlay;
+  $('#fly-tour').onclick = () => { cancelTour(); startCinematicTour(); };
+  $('#fly-gp').onclick = () => { cancelTour(); flyTo(state.viewer, SITE.gp.lon, SITE.gp.lat - 0.014, state.ents.groundH + 1500, 0, -38); };
+  $('#run-brief').onclick = () => { cancelTour(); state.brief.present(buildBriefingSteps()); };
+  $('#fly-north').onclick = () => { cancelTour(); flyTo(state.viewer, SITE.gp.lon, SITE.gp.lat + 0.04, 3600, 180, -42); };
+  $('#fly-hub').onclick = () => { cancelTour(); flyTo(state.viewer, SITE.hub.lon, SITE.hub.lat - 0.011, state.ents.hubGroundH + 1200, 0, -38); };
+
+  $('#goto-env')?.addEventListener('click', (e) => { e.preventDefault(); switchTab('gis'); });
+  renderEnvSummary();
+  renderTwinCost();
+}
+
+/** 트윈 탭용 환경 한 줄 요약 — 세부 조종 패널은 지도 탭에 하나만 둔다(중복 제거). */
+function renderEnvSummary() {
+  const el = $('#env-summary');
+  if (!el || !state.env?.state) return;
+  el.textContent = state.env.headline();
+}
+
+function renderTwinCost() {
+  const h = state.ents.towerHeight;
+  const el = $('#twin-cost');
+  if (!el) return;
+  el.innerHTML = `
+    <div class="kv"><span>감시탑 ${h}m</span><b>${towerCostEok(h).toFixed(1)}억</b></div>
+    <div class="kv"><span>배치 시설 ${state.placer.items.length}동</span><b>${fmtKrw(state.placer.totalKrw())}</b></div>
+    <div class="kv"><span><b>합계</b></span><b style="color:var(--accent)">${fmtKrw(totalCostKrw())}</b></div>`;
+}
+
+function setTowerHeight(h) {
+  state.ents.towerHeight = h;
+  const tv = $('#twin-height-val'); if (tv) tv.textContent = `${h}m`;
+  const ts = $('#twin-height'); if (ts && +ts.value !== h) ts.value = h;
+  state.fpv.sync();
+  renderTwinCost();
+  if ($('#page-twin').classList.contains('active')) renderVantageList();
+  if (state.fpv.active) renderFpvSwitch();
+  updateHud();
+  state.store?.commit();
+}
+
+/**
+ * KCTC/Warrior 근거에서 도출한 시설 소요를 현재 배치 엔진으로 전달한다.
+ * 위치는 목업 후보를 사용하지만, 최종 지반고·토공·공사비는 PlacementManager가
+ * 현재 지형을 다시 샘플링해 계산한다.
+ */
+async function applyTrainingPlan(plan) {
+  if (!plan?.needs?.length || !state.placer) return;
+  switchTab('build');
+  setLoading(true, '훈련근거 시설 소요를 GP 배치안으로 변환 중…');
+  const placed = [];
+  const blocked = [];
+  try {
+    for (const need of plan.needs) {
+      const candidates = [need.selectedCandidate, ...(need.candidates ?? [])]
+        .filter(Boolean)
+        .filter((candidate, index, all) => all.findIndex((item) => item.id === candidate.id) === index);
+      let item = null;
+      let reason = '';
+      for (const candidate of candidates) {
+        const result = await state.placer.place(need.facilityTypeId, candidate.lon, candidate.lat, {
+          functionTag: need.label,
+          headingDeg: 0,
+        });
+        if (result && !result.blocked) {
+          item = result;
+          break;
+        }
+        reason = result?.blocked ?? '배치 불가';
+      }
+      if (item) placed.push({ need, item });
+      else blocked.push(`${need.label}(${reason})`);
+    }
+  } finally {
+    setLoading(false);
+  }
+  state.training.appliedPlan = {
+    ...plan,
+    appliedAt: new Date().toISOString(),
+    placedNeedIds: placed.map(({ need }) => need.id),
+  };
+  state.store?.commit();
+  renderBuildTab();
+  refreshPlacedList();
+  renderPlanStats();
+  const cost = placed.reduce((sum, row) => sum + (row.item.cost?.totalKrw ?? 0), 0);
+  toast(
+    `훈련근거 배치안 적용 · ${placed.length}/${plan.needs.length}개 기능 · 추가 공사비 ${fmtKrw(cost)}`
+      + (blocked.length ? ` · 배치 불가 ${blocked.length}건` : ''),
+    6200,
+  );
+}
+
+/** 교전 제원 카드 (한국군 사격지휘 형식: 방위각·고저각 밀 단위) */
+function openFireCard(routeId) {
+  const u = state.infil.units.find((x) => x.rd.route.id === routeId);
+  if (!u) return;
+  const st = state.infil._state(u);
+  const obsH = state.ents.groundH + state.ents.towerHeight + 2;
+  const fm = fireMission(SITE.gp, obsH, { lon: st.p.lon, lat: st.p.lat }, st.p.h + 1);
+  const observed = st.vis;
+
+  // ─── KAIROS 화력운용 판단 (원본 교리표 직접 조회) ───
+  // 표적에서 가장 가까운 아군 시설(배치 건물 · GP 본체)까지 거리 = 부수피해 검증 기준
+  const friendlyDists = [
+    distM(SITE.gp.lon, SITE.gp.lat, st.p.lon, st.p.lat),
+    ...state.placer.items.map((it) => distM(it.lon, it.lat, st.p.lon, st.p.lat)),
+  ];
+  const nearestFriendlyM = Math.min(...friendlyDists);
+  const fd = fireDecision({
+    distanceM: fm.distM,
+    terrainClassLabel: state.intel?.terrainClass ?? null,
+    forestRatio: state.intel?.forestSampleRatio ?? 0,
+    nearestFriendlyM,
+  });
+  state.lastFireDecision = fd;
+  const effectRow = fd.options[0] ?? null;
+
+  $('#fire-body').innerHTML = `
+    <div class="kv"><span>표적</span><b style="color:${u.rd.route.color}">${u.rd.route.name.split(' — ')[0]} (${MOVE_MODES[state.infil.mode].name.split(' ')[0]})</b></div>
+    <div class="kv"><span>표적 좌표 (MGRS)</span><b>${toMGRS(st.p.lon, st.p.lat)}</b></div>
+    <div class="kv"><span>사거리</span><span class="fm-big">${Math.round(fm.distM).toLocaleString()}m</span></div>
+    <div class="kv"><span>방위각</span><b>${fm.azMils.toLocaleString()}밀 (${fm.azDeg.toFixed(1)}°)</b></div>
+    <div class="kv"><span>고저각</span><b>${fm.elevMils > 0 ? '+' : ''}${fm.elevMils}밀 (고도차 ${fm.dH > 0 ? '+' : ''}${Math.round(fm.dH)}m)</b></div>
+    <div class="kv"><span>관측 상태</span><span class="badge ${observed ? 'pass' : 'fail'}">${observed ? '타워 관측중' : '지형 차폐 — 간접 제원'}</span></div>
+    <div class="kv"><span>사거리 내 가용화기</span><b>${fm.weapons.length ? fm.weapons.map((w) => w.name.split(' ')[0]).join('·') : '없음 — 화력지원 요청'}</b></div>
+    <p class="muted" style="margin-top:4px">타워 관측고 ${Math.round(obsH)}m 기준 · 6400분법 · 이동 표적이므로 재클릭으로 제원 갱신</p>
+
+    <div class="fm-sec">KAIROS 화력운용 판단</div>
+    <div class="kv"><span>종합 판단</span><span class="badge ${fd.ok ? 'pass' : 'fail'}">${fd.verdict}</span></div>
+    <div class="kv"><span>사거리대 · 지형</span><b>${fd.rangeBand ?? '-'} · ${fd.terrainLabel}</b></div>
+    ${effectRow ? `<div class="kv"><span>탄종·발수 (요망효과)</span><b>${
+      Object.entries(effectRow.effects).map(([k, v]) => `${k}% ${v}`).join(' · ')}</b></div>
+    <p class="muted" style="margin-top:2px">사격단위 ${effectRow.fireUnit} · 표적유형 ${effectRow.targetType}</p>`
+      : '<p class="muted">해당 사거리대의 탄약효과표 행이 없습니다.</p>'}
+
+    <div class="kv"><span>최근접 아군 시설</span><b>${Math.round(nearestFriendlyM).toLocaleString()}m</b></div>
+    <div class="fm-cde">${fd.collateral.map((c) => `
+      <span class="cde-chip ${c.safe === false ? 'ng' : 'ok'}" title="피해반경 ${c.radiusM}m + 안전여유 ${fd.safetyMarginM}m">
+        ${c.munition} ${c.requiredM}m${c.safe === false ? ` (−${Math.round(c.shortfallM)}m)` : ''}</span>`).join('')}</div>
+    <p class="muted" style="margin-top:2px">부수피해평가(CDE) 반경 + 요구 안전여유 ${fd.safetyMarginM}m 기준</p>
+
+    <div class="kv"><span>사격부대</span><b>${fd.units.filter((x) => x.firable).length}/${fd.units.length} 가용</b></div>
+    ${fd.units.slice(0, 3).map((x) => `
+      <div class="kv"><span>${x.unit}</span>
+        <span class="badge ${x.firable ? 'pass' : 'fail'}">${x.judgment}${x.civilianSafe ? '' : ' · 민간피해'}</span></div>`).join('')}
+    <p class="muted" style="margin-top:4px">탄약효과표·부수피해(CDE)·사격부대 제원은 KAIROS 원본 교리 데이터
+    (<code>sudoMunitionEffectIntel · sudoCollateralCdeTable · sudoFiringUnitIntel</code>)를 그대로 조회한 결과입니다.</p>`;
+  $('#fire-card').classList.remove('hidden');
+}
+
+// ═════════════ ①.5 지도 (GIS·환경) ═════════════
+function renderGisTab() {
+  $('#page-gis').innerHTML = `
+    <div class="sec"><div class="sec-title">블렌더 3D 정밀지형</div>
+      ${SITE.hasPrecisionTerrain ? `
+      <button class="mode-toggle" id="gp3d-toggle"><b>GP-107 정밀지형</b><span>한국 수종 숲 · 5km 크롭</span></button>
+      <p class="muted" style="margin-top:4px">GP-107 능선 5km를 크롭해 한국 수종(소나무·참나무) 실물 나무와
+      고해상 수관 텍스처로 재현한 블렌더 모델입니다.</p>` : `
+      <p class="muted">이 세션의 GP(「${SITE.name}」)는 정밀지형이 구축되지 않은 위치입니다 — 위성영상·기본
+      지형으로만 봅니다. 정밀지형은 지금 GP-107 한 곳뿐이며, 세션을 새로 만들 때 목록에서 고를 수 있습니다.</p>`}
+      <div class="ctx-row" id="gp-ctx-row" hidden>
+        <label for="gp-ctx">표출 범위</label>
+        <input type="range" id="gp-ctx" min="2.5" max="30" step="2.5" value="2.5">
+        <b id="gp-ctx-v">격리</b>
+      </div>
+      <p class="muted" style="margin-top:2px" id="gp-ctx-hint" hidden>왼쪽 끝은 <b>격리(디오라마)</b> — 정밀 타일만 검은 공간에.
+      오른쪽으로 키우면 주변 지형을 <b>VWorld 위성/지형</b>으로 이어 붙여 최대 30km 맥락을 봅니다(넓힐수록 렉↑).</p>
+      <button class="mode-toggle" id="suit-toggle" style="margin-top:6px"><b>건축적지 분석</b><span>지반 경사 색칠 · 초록 양호/주황 정지/빨강 불가</span></button>
+      <p class="muted" style="margin-top:4px">렌더 지형의 경사를 격자로 판정해 <b style="color:#3dd68c">건축 양호(≤10°)</b> ·
+      <b style="color:#e3b341">정지 필요(≤20°)</b> · <b style="color:#ed5d5d">건축 불가(&gt;20°)</b> 로 색칠합니다. 배치 전에 벤치·안부를 찾으세요.</p>
+      <button class="mode-toggle" id="road-toggle" style="margin-top:6px"><b>접근로·순환 분석</b><span>감시탑 허브 최소연결 · 구간 종단경사로 차량 통행 판정</span></button>
+      <p class="muted" style="margin-top:4px">배치 시설을 감시탑 중심으로 최소 연결하고 각 구간을 지형에 드레이프해 종단경사를 잽니다 —
+      <b style="color:#3dd68c">차량 원활(≤10°)</b> · <b style="color:#e3b341">차량 급(≤17°)</b> · <b style="color:#ed5d5d">도보 전용(&gt;17°)</b>.</p></div>
+    <div class="sec"><div class="sec-title">베이스맵</div>
+      <div class="basemap-grid" id="basemap-grid"></div></div>
+    <div class="sec"><div class="sec-title">오버레이</div><div id="overlay-list"></div>
+      <div class="layer-row"><span class="l-name">VWorld 3D 건물 (LOD4)</span>
+        <input type="checkbox" id="ov-bldg"></div></div>
+    <div class="sec"><div class="sec-title">지형 소스</div><div id="terrain-list"></div>
+      <p class="muted" style="margin-top:4px">지형 교체 시 가시영역·축선 경사가 새 지형으로 재계산됩니다.</p></div>
+    <div class="sec"><div class="sec-title">지형분석 표출</div><div id="tmode-list"></div>
+      <p class="muted" style="margin-top:4px">경사도는 이동수단 한계(차량 24°·구보 30°·도보 38°) 기동성 색상.</p></div>
+    <div class="sec"><div class="sec-title">환경 · 태양·그림자</div>
+      <p class="muted" style="margin-bottom:6px">환경 조종은 <b>이 패널 하나뿐</b>입니다 — 다른 모든 탭·1인칭·감시 피드가
+      같은 상태를 그대로 봅니다.</p>
+      <div class="btn-row" id="env-presets" style="flex-wrap:wrap"></div>
+      <div id="env-mount-gis"></div>
+      <p class="muted" style="margin-top:6px">시각·계절이 태양 위치(NOAA)와 지형 그림자를, 날씨·강도가 안개(Koschmieder)·
+      강수·조도를 정합니다. 일출·일몰 음영으로 관측 취약 시간대를 확인하세요 — 동사면 GP는 석양에 실명합니다.</p></div>
+    <div class="sec"><div class="sec-title">렌더링 품질</div>
+      <div class="btn-row" id="quality-row"></div>
+      <div class="kv" style="margin-top:6px"><span>현재 프레임률</span><b id="quality-fps">— fps</b></div>
+      <p class="muted" style="margin-top:4px">기본값은 외장 GPU 시연 기준(MSAA 4× · 블룸 · HDR)입니다.
+      노트북 내장그래픽이나 원격 데스크톱에서 화면이 끊기면 단계를 낮추세요 —
+      끄는 순서는 체감 대비 비용이 큰 것부터입니다(블룸·HDR → MSAA → 해상도 배율 → 지형 LOD).</p></div>
+    <div class="sec"><div class="sec-title">측정</div>
+      <div class="btn-row">
+        <button class="btn" id="m-dist">표면거리</button>
+        <button class="btn" id="m-prof">고도 프로파일</button>
+        <button class="btn" id="m-area">면적</button>
+        <button class="btn" id="m-clear">지우기</button>
+      </div></div>
+    <div class="sec"><div class="sec-title">내보내기</div>
+      <button class="btn full" id="export-geojson">계획 GeoJSON 내보내기 (타워·시설·NAI/DP/TAI·축선)</button></div>`;
+
+  // 베이스맵
+  const bg = $('#basemap-grid');
+  bg.innerHTML = BASEMAPS.map((b) => `
+    <div class="card clickable ${state.layers.basemapId === b.id ? 'selected' : ''}" data-bm="${b.id}">${b.name}</div>`).join('');
+  bg.querySelectorAll('[data-bm]').forEach((c) => {
+    c.onclick = async () => {
+      setLoading(true, '베이스맵 전환…');
+      try { await state.layers.setBasemap(c.dataset.bm); } catch (e) { toast('베이스맵 로드 실패: ' + e.message); }
+      setLoading(false);
+      renderGisTab();
+    };
+  });
+
+  // 오버레이
+  $('#overlay-list').innerHTML = OVERLAYS.map((o) => `
+    <div class="layer-row"><span class="l-name">${o.name}</span>
+      <input type="range" data-ova="${o.id}" min="0" max="1" step="0.05" value="${state.layers.overlayLayers.get(o.id)?.alpha ?? o.alpha}">
+      <input type="checkbox" data-ov="${o.id}" ${state.layers.hasOverlay(o.id) ? 'checked' : ''}></div>`).join('');
+  $$('#overlay-list [data-ov]').forEach((cb) => {
+    cb.onchange = async () => {
+      setLoading(true, '오버레이 적용…');
+      try { await state.layers.toggleOverlay(cb.dataset.ov, cb.checked); } catch (e) { toast('로드 실패: ' + e.message); }
+      setLoading(false);
+    };
+  });
+  $$('#overlay-list [data-ova]').forEach((sl) => {
+    sl.oninput = () => state.layers.setOverlayAlpha(sl.dataset.ova, +sl.value);
+  });
+  // 블렌더 GP 정밀지형 토글 — 이 GLB는 GP-107 좌표로 구운 것이라 다른 위치 세션에서
+  // 켜면 엉뚱한 좌표에 지형이 뜬다. 그런 세션에서는 버튼 자체를 렌더하지 않는다(위 템플릿).
+  const gpBtn = $('#gp3d-toggle');
+  if (gpBtn) {
+    const gpOn = (state.realTerrain?.mode === 'gp');
+    gpBtn.classList.toggle('active', gpOn);
+    gpBtn.onclick = async () => {
+      const turnOn = !(state.realTerrain?.mode === 'gp');
+      setLoading(true, turnOn ? 'GP 정밀지형 로딩… (블렌더 실물 숲, 최초 1회 수십 초)' : '위성 지형 복귀…');
+      try {
+        await state.realTerrain.setMode(turnOn ? 'gp' : 'nation');
+        if (!turnOn) { state.placer?.showSuitability(false); state.placer?.showRoads(false); }   // 전역 복귀 시 오버레이 정리
+        // GP 토글도 "지형 소스 교체"의 일종이다 — onTerrainChange(VWorld/MapTiler
+        // 전환)가 이미 하는 전체 재계산을 여기서도 그대로 해 준다. 가시영역 캐시는
+        // 관측점 좌표·고도만으로 키를 잡아 전환을 모르므로 안 지우면 다른 지형
+        // 기준으로 잰 낡은 격자를 재사용해 커버리지가 화면과 어긋난다.
+        clearViewshedCache();
+        clearRoutes();
+        state.grid = null; state.gridHeight = null; state.coveragePct = null;
+        state.covEngine = null;
+        state.watchTab?.invalidate();
+        // 지형 표면 자체가 바뀌었다 — 감시탑·초소·허브·시설 지반고를 전부 새 표면 기준으로
+        // 다시 잰다. 안 하면 옛 지형에서 잰 높이 그대로 남아 새 블렌더 표면 위에 공중부양한다.
+        await remeasureGroundHeights();
+        await prepareRoutes(viewer);
+        await state.routeSketch.restoreAll();   // 작도 축선도 새 지형으로 재클램프
+        state.infil.rebuild();
+        state.training?._draw();         // 훈련근거 오버레이도 새 표면 기준으로 다시 그린다(같은 공중부양 결함)
+        if (state.mgrsGrid?.enabled) state.mgrsGrid._rebuild();  // MGRS 격자도 새 표면 기준으로
+        state.coa?.redrawAll();          // COA 도식도 새 표면 기준으로
+        state.siteWorks?.schedule();     // 표면이 바뀌면 접지·접근로를 전부 다시 뜬다
+      } catch (err) { toast('정밀지형 로드 실패: ' + err.message); }
+      state.env?.apply();
+      setLoading(false);
+      renderGisTab();
+      renderInfilTab();
+      toast(turnOn ? 'GP-107 정밀지형 — 실물 숲 3D' : '위성 지형으로 복귀');
+    };
+  }
+
+  // 표출 범위 슬라이더 (격리 ↔ 주변 VWorld 포함) — GP 모드일 때만 노출
+  const ctxRow = $('#gp-ctx-row'); const ctxHint = $('#gp-ctx-hint');
+  const ctxSl = $('#gp-ctx'); const ctxV = $('#gp-ctx-v');
+  const gpActive = (state.realTerrain?.mode === 'gp');
+  if (ctxRow) { ctxRow.hidden = !gpActive; if (ctxHint) ctxHint.hidden = !gpActive; }
+  if (ctxSl && gpActive) {
+    ctxSl.value = String(state.realTerrain.contextRadiusKm());
+    const fmtCtx = (km) => (km <= 2.5 ? '격리' : `${km}km`);
+    ctxV.textContent = fmtCtx(+ctxSl.value);
+    ctxSl.oninput = () => { ctxV.textContent = fmtCtx(+ctxSl.value); };
+    ctxSl.onchange = () => {
+      const km = +ctxSl.value;
+      if (km > 2.5) setLoading(true, `주변 VWorld 지형 ${km}km 표출…`);
+      state.realTerrain.setContextRadiusKm(km);
+      setLoading(false);
+      toast(km <= 2.5 ? '격리(디오라마) — 정밀 타일만' : `표출 범위 ${km}km — 주변 VWorld 지형 포함`);
+    };
+  }
+
+  // 건축적지 분석 오버레이 토글 (GP 정밀지형 필요)
+  const suitBtn = $('#suit-toggle');
+  suitBtn.classList.toggle('active', state.placer?.suitabilityActive?.());
+  suitBtn.onclick = async () => {
+    if (state.realTerrain?.mode !== 'gp') { toast('먼저 GP 정밀지형을 켜세요'); return; }
+    const on = !state.placer.suitabilityActive();
+    if (on) setLoading(true, '건축적지 경사 분석 중…');
+    state.placer.showSuitability(on);
+    setLoading(false);
+    suitBtn.classList.toggle('active', on);
+    toast(on ? '건축적지 오버레이 — 초록 양호 / 주황 정지필요 / 빨강 건축불가' : '건축적지 오버레이 해제');
+  };
+
+  // 접근로·순환망 분석 토글 (GP 정밀지형 필요)
+  const roadBtn = $('#road-toggle');
+  roadBtn.classList.toggle('active', state.placer?.roadNetworkActive?.());
+  roadBtn.onclick = () => {
+    if (state.realTerrain?.mode !== 'gp') { toast('먼저 GP 정밀지형을 켜세요'); return; }
+    if (!state.placer.items.length) { toast('배치된 시설이 없습니다 — 먼저 시설을 배치하세요'); return; }
+    const on = !state.placer.roadNetworkActive();
+    state.placer.showRoads(on);
+    roadBtn.classList.toggle('active', on);
+    toast(on ? `접근로 분석 — 총 연장 ${Math.round(state.placer.roadTotalM()).toLocaleString()}m` : '접근로 분석 해제');
+  };
+
+  $('#ov-bldg').checked = !!state.layers.buildings;
+  $('#ov-bldg').onchange = async (e) => {
+    setLoading(true, 'VWorld 3D 건물 타일셋…');
+    try { await state.layers.toggleBuildings(e.target.checked); }
+    catch (_) { toast('3D 건물 로드 실패 (DMZ 인근은 건물 데이터가 희박합니다)'); e.target.checked = false; }
+    setLoading(false);
+  };
+
+  // 지형 소스
+  $('#terrain-list').innerHTML = TERRAINS.map((t) => `
+    <div class="card clickable ${state.layers.terrainId === t.id ? 'selected' : ''}" data-tr="${t.id}" style="padding:7px 10px">
+      <h4 style="margin:0;font-size:12px">${t.name}</h4></div>`).join('');
+  $$('#terrain-list [data-tr]').forEach((c) => {
+    c.onclick = async () => {
+      setLoading(true, '지형 소스 전환·분석 캐시 재구축…');
+      try { await state.layers.setTerrain(c.dataset.tr); } catch (e) { toast('지형 로드 실패: ' + e.message); }
+      setLoading(false);
+      renderGisTab();
+    };
+  });
+
+  // 지형분석 모드
+  $('#tmode-list').innerHTML = `<div class="btn-row" style="flex-wrap:wrap">${TERRAIN_MODES.map((m) =>
+    `<button class="btn ${state.terrainMode === m.id ? 'primary' : ''}" data-tm="${m.id}" style="flex:1 1 30%">${m.name}</button>`).join('')}</div>`;
+  $$('#tmode-list [data-tm]').forEach((b) => {
+    b.onclick = () => {
+      state.terrainMode = b.dataset.tm;
+      setTerrainMode(state.viewer, state.terrainMode);
+      // 지형분석 표출과 적설은 같은 globe.material 을 원한다 — 표출이 켜지면
+      // 적설이 양보하고, 꺼지면 다시 앉는다.
+      state.weather?.setTerrainMode(state.terrainMode);
+      state.env?.apply();
+      renderGisTab();
+    };
+  });
+
+  // 환경 — 조종 패널은 이 탭 한 곳뿐이다(중복 제거, 트윈 탭은 요약만 본다)
+  renderEnvPresets('#env-presets');
+  renderEnvironmentPanel($('#env-mount-gis'), state.env);
+
+  // 측정
+  // 렌더링 품질
+  const qRow = $('#quality-row');
+  const drawQuality = () => {
+    qRow.innerHTML = QUALITY_PRESETS.map((q) => `
+      <button class="btn ${state.qualityId === q.id ? 'primary' : ''}" data-q="${q.id}"
+        title="${q.hint}" style="flex:1">${q.name}</button>`).join('');
+    qRow.querySelectorAll('[data-q]').forEach((b) => {
+      b.onclick = () => {
+        const p = applyQuality(state.viewer, b.dataset.q);
+        state.qualityId = p.id;
+        drawQuality();
+        toast(`렌더링 품질: ${p.name} — MSAA ${p.msaa || '끔'} · 블룸 ${p.bloom ? '켬' : '끔'} · 배율 ${p.resolution}×`, 4200);
+      };
+    });
+  };
+  drawQuality();
+
+  $('#m-dist').onclick = () => { state.measure.setMode('distance'); toast('표면거리: 클릭으로 구간 추가 · 우클릭 종료'); };
+  $('#m-prof').onclick = () => { state.measure.setMode('profile'); toast('고도 프로파일: 시점·종점 2회 클릭'); };
+  $('#m-area').onclick = () => { state.measure.setMode('area'); toast('면적: 꼭짓점 클릭 · 우클릭으로 폐합'); };
+  $('#m-clear').onclick = () => { state.measure.clear(); $('#profile-card').classList.add('hidden'); };
+  syncMeasureButtons(state.measure?.mode ?? null);   // 탭을 다시 열어도 현재 모드가 보인다
+
+  $('#export-geojson').onclick = exportGeoJSON;
+}
+
+/** 계획 GeoJSON 내보내기 */
+function exportGeoJSON() {
+  const features = [];
+  const g = SITE.gp;
+  features.push({
+    type: 'Feature',
+    properties: { kind: 'tower', name: '감시탑', heightM: state.ents.towerHeight, costEok: +towerCostEok(state.ents.towerHeight).toFixed(1), mgrs: toMGRS(g.lon, g.lat) },
+    geometry: { type: 'Point', coordinates: [g.lon, g.lat, state.ents.groundH] },
+  });
+  for (const it of state.placer.items) {
+    const hw = it.dims.widthM / 2, hd = it.dims.depthM / 2;
+    const corners = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd], [-hw, -hd]].map(([dx, dy]) => {
+      const az = (Math.atan2(dx, dy) * 180 / Math.PI + it.headingDeg + 360) % 360;
+      const r = Math.hypot(dx, dy);
+      const p = offset(it.lon, it.lat, az, r);
+      return [p.lon, p.lat];
+    });
+    features.push({
+      type: 'Feature',
+      properties: {
+        kind: 'facility', facilityTypeId: it.spec.id, name: it.spec.name,
+        capacity: it.capacity, floors: it.floors, protection: it.protection,
+        totalKrw: it.cost.totalKrw, earthworkKrw: it.cost.earthworkKrw,
+        difficulty: it.cost.difficulty, mgrs: toMGRS(it.lon, it.lat),
+      },
+      geometry: { type: 'Polygon', coordinates: [corners] },
+    });
+  }
+  for (const it of state.ipb.items) {
+    features.push({
+      type: 'Feature',
+      properties: { kind: 'ipb', type: it.kind, index: it.n, note: it.note, mgrs: toMGRS(it.lon, it.lat) },
+      geometry: { type: 'Point', coordinates: [it.lon, it.lat, it.h ?? 0] },
+    });
+  }
+  for (const rd of allRouteData()) {
+    features.push({
+      type: 'Feature',
+      properties: {
+        kind: 'avenue-of-approach', name: rd.route.name,
+        slopeP95Deg: +rd.slopeP95.toFixed(1), lengthM: Math.round(rd.totalM),
+        vehicleFeasible: routeFeasible(rd, 'vehicle'),
+      },
+      geometry: { type: 'LineString', coordinates: rd.route.waypoints },
+    });
+  }
+  const fc = { type: 'FeatureCollection', name: 'gp-digital-twin-plan', crs: { type: 'name', properties: { name: 'EPSG:4326' } }, features };
+  const blob = new Blob([JSON.stringify(fc, null, 2)], { type: 'application/geo+json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `gp-digital-twin-plan-${Date.now()}.geojson`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast(`GeoJSON 내보내기 — 피처 ${features.length}개 (QGIS·ArcGIS에서 열 수 있습니다)`);
+}
+
+// ═════════════ 계획 패널: 스탯 타일 + 도면 미리보기 모달 ═════════════
+/** Scaffolda sfSummaryGrid 스타일 스탯 타일 (헤어라인 격자) */
+function renderPlanStats() {
+  const el = $('#plan-stats');
+  if (!el) return;
+  const items = state.placer.items;
+  const pc = computeProjectCost(items, towerCostEok(state.ents.towerHeight) * EOK);
+  const hardened = items.filter((i) => i.protection === 'hardened').length;
+  const severe = items.filter((i) => i.cost.difficulty === 'severe').length;
+  el.innerHTML = `
+    <div class="stat-cell"><span class="st-k">시설</span><span class="st-v">${items.length}<em>동</em></span></div>
+    <div class="stat-cell"><span class="st-k">연면적</span><span class="st-v">${Math.round(pc.floorAreaM2).toLocaleString()}<em>㎡</em></span></div>
+    <div class="stat-cell"><span class="st-k">총사업비</span><span class="st-v accent">${fmtKrw(pc.totalKrw)}</span></div>
+    <div class="stat-cell"><span class="st-k">방호 / 재선정권고</span>
+      <span class="st-v">${hardened}<em>동</em>${severe ? ` <b style="color:var(--bad)">⚠${severe}</b>` : ''}</span></div>`;
+}
+
+/**
+ * 스냅샷 하나를 「안(案)의 지표」로 요약한다.
+ *
+ * 직렬화된 아이템에는 spec 객체가 없다 — 카탈로그에서 하이드레이션해야 원본
+ * computeProjectCost 가 받아들이는 계약이 된다. 슬롯도 현재 배치도 같은 함수로
+ * 요약해야 비교표의 두 열이 같은 자를 쓴다.
+ */
+function planSummary(snap) {
+  const rows = snap?.items ?? [];
+  const hydrated = rows.map((d, i) => ({
+    uid: `sum-${i}`,
+    spec: FACILITY_CATALOG.find((f) => f.id === d.specId)
+      ?? { id: d.specId, name: d.specId, category: 'other' },
+    dims: d.dims, cost: d.cost, floors: d.floors, capacity: d.capacity,
+    protection: d.protection,
+  }));
+  const towerH = snap?.towerHeight ?? 18;
+  let pc = { totalKrw: 0, constructionKrw: 0, designFeeKrw: 0, permitFeeKrw: 0, floorAreaM2: 0 };
+  try { pc = computeProjectCost(hydrated, towerCostEok(towerH) * EOK); } catch { /* 구버전 스냅샷 */ }
+  return {
+    count: hydrated.length,
+    capacity: hydrated.reduce((a, b) => a + (b.capacity ?? 0), 0),
+    floorAreaM2: pc.floorAreaM2,
+    totalKrw: pc.totalKrw,
+    constructionKrw: pc.constructionKrw,
+    designFeeKrw: pc.designFeeKrw,
+    permitFeeKrw: pc.permitFeeKrw,
+    hardened: hydrated.filter((i) => i.protection === 'hardened').length,
+    severe: hydrated.filter((i) => i.cost?.difficulty === 'severe').length,
+    earthworkKrw: hydrated.reduce((a, b) => a + (b.cost?.earthworkKrw ?? 0), 0),
+    towerHeight: towerH,
+    ipb: snap?.ipb?.length ?? 0,
+  };
+}
+
+/**
+ * 안(案) 비교표 — 「안 비교」라고 써 두고 정작 나란히 놓는 화면이 없었다.
+ * 왼쪽은 언제나 **지금 화면의 배치**다. 저장본끼리 비교하려면 하나를 먼저 열면 된다.
+ */
+function renderPlanCompare() {
+  const el = $('#slot-compare');
+  if (!el) return;
+  const name = state.compareSlot;
+  if (!name) { el.innerHTML = ''; return; }
+  const snap = state.store.loadSlot(name);
+  if (!snap) { state.compareSlot = null; el.innerHTML = ''; return; }
+  const A = planSummary(state.store.serialize());
+  const B = planSummary(snap);
+  const krw = (v) => fmtKrw(v);
+  const num = (v, unit) => `${Math.round(v).toLocaleString()}${unit}`;
+  // 차이는 「B 를 고르면 무엇이 달라지는가」다 — 부호는 B − A.
+  const delta = (a, b, fmt, goodWhenLower = false) => {
+    const d = b - a;
+    if (Math.abs(d) < 1e-9) return '<span class="cmp-same">동일</span>';
+    const good = goodWhenLower ? d < 0 : d > 0;
+    return `<span class="cmp-d ${good ? 'up' : 'down'}">${d > 0 ? '+' : '−'}${fmt(Math.abs(d))}</span>`;
+  };
+  const row = (label, a, b, fmt, goodWhenLower = false) => `
+    <tr><th>${label}</th><td>${fmt(a)}</td><td>${fmt(b)}</td><td>${delta(a, b, fmt, goodWhenLower)}</td></tr>`;
+  el.innerHTML = `
+    <div class="cmp-head"><b>현재 배치</b> ↔ <b style="color:var(--accent)">${name}</b>
+      <button class="btn cmp-x" id="cmp-close">✕</button></div>
+    <div class="tbl-scroll"><table class="dtbl cmp-tbl"><thead><tr>
+      <th>항목</th><th>현재</th><th>${name}</th><th>차이</th></tr></thead><tbody>
+      ${row('시설 동수', A.count, B.count, (v) => num(v, '동'))}
+      ${row('수용 인원', A.capacity, B.capacity, (v) => num(v, '인'))}
+      ${row('연면적', A.floorAreaM2, B.floorAreaM2, (v) => num(v, '㎡'))}
+      ${row('공사비', A.constructionKrw, B.constructionKrw, krw, true)}
+      ${row('토공비', A.earthworkKrw, B.earthworkKrw, krw, true)}
+      ${row('설계비', A.designFeeKrw, B.designFeeKrw, krw, true)}
+      ${row('인허가', A.permitFeeKrw, B.permitFeeKrw, krw, true)}
+      ${row('총사업비', A.totalKrw, B.totalKrw, krw, true)}
+      ${row('방호 시설', A.hardened, B.hardened, (v) => num(v, '동'))}
+      ${row('재선정 권고', A.severe, B.severe, (v) => num(v, '동'), true)}
+      ${row('감시탑', A.towerHeight, B.towerHeight, (v) => num(v, 'm'))}
+      ${row('전술 도식', A.ipb, B.ipb, (v) => num(v, '개'))}
+    </tbody></table></div>
+    <p class="muted" style="margin-top:4px">초록 = 그 안으로 바꿀 때 유리한 방향(비용은 낮을수록,
+    규모는 클수록). 「재선정 권고」는 1인당 부지비용이 과대한 동수 — 낮을수록 좋습니다.
+    비교만으로는 배치가 바뀌지 않습니다. 바꾸려면 목록에서 「열기」.</p>`;
+  $('#cmp-close').onclick = () => { state.compareSlot = null; renderPlanCompare(); renderSlotList(); };
+}
+
+/** 계획안 슬롯 목록 — 안별 동수·총사업비 즉석 비교 */
+function renderSlotList() {
+  const el = $('#slot-list');
+  if (!el) return;
+  const slots = state.store.listSlots();
+  const names = Object.keys(slots);
+  if (!names.length) {
+    el.innerHTML = '<p class="muted" style="margin:2px 12px">저장된 계획안이 없습니다.</p>';
+    return;
+  }
+  el.innerHTML = names.map((name) => {
+    const s = slots[name];
+    const n = s.items?.length ?? 0;
+    let costTxt = '—';
+    try {
+      // 직렬화 아이템엔 spec 객체가 없으므로 카탈로그에서 하이드레이션
+      const hydrated = (s.items ?? []).map((d, i) => ({
+        uid: `slot-${i}`,
+        spec: FACILITY_CATALOG.find((f) => f.id === d.specId) ?? { id: d.specId, name: d.specId, category: 'other' },
+        dims: d.dims, cost: d.cost, floors: d.floors, capacity: d.capacity,
+      }));
+      const pc = computeProjectCost(hydrated, towerCostEok(s.towerHeight ?? 18) * EOK);
+      costTxt = fmtKrw(pc.totalKrw);
+    } catch { /* 구버전 스냅샷 */ }
+    const when = (s.updatedAt ?? '').slice(5, 16).replace('T', ' ');
+    const cmp = state.compareSlot === name;
+    return `<div class="slot-item${cmp ? ' comparing' : ''}" data-slot="${name}">
+      <div class="sl-main"><span class="sl-name">${name}</span>
+        <span class="sl-meta">${n}동 · ${costTxt} · ${when}</span></div>
+      <button class="btn sl-cmp${cmp ? ' active' : ''}" title="현재 배치와 나란히 비교" aria-label="${name} 비교">⇄</button>
+      <button class="btn sl-open" title="이 안으로 전환" aria-label="${name}으로 전환">열기</button>
+      <button class="btn sl-del" title="삭제" aria-label="${name} 계획안 삭제">✕</button>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.slot-item').forEach((row) => {
+    const name = row.dataset.slot;
+    row.querySelector('.sl-open').onclick = () => {
+      const snap = state.store.loadSlot(name);
+      if (!snap) return;
+      state.store.applySnapshotWithHistory(snap);   // 직전 상태 히스토리 push — Ctrl+Z 복귀
+      toast(`계획안 「${name}」 전환 — 시설 ${snap.items?.length ?? 0}동 · 타워 ${snap.towerHeight}m`);
+    };
+    row.querySelector('.sl-cmp').onclick = () => {
+      // 같은 안을 다시 누르면 비교를 닫는다 — 토글이 아니면 끄는 법을 따로 배워야 한다.
+      state.compareSlot = state.compareSlot === name ? null : name;
+      renderSlotList();
+      renderPlanCompare();
+    };
+    row.querySelector('.sl-del').onclick = () => {
+      state.store.deleteSlot(name);
+      if (state.compareSlot === name) state.compareSlot = null;
+      renderSlotList();
+      renderPlanCompare();
+      toast(`계획안 「${name}」 삭제`);
+    };
+  });
+  renderPlanCompare();
+}
+
+function updateHistoryButtons(undoN, redoN) {
+  const u = $('#plan-undo'), r = $('#plan-redo');
+  if (u) { u.disabled = !undoN; $('#plan-undo-n').textContent = undoN ? ` ${undoN}` : ''; }
+  if (r) { r.disabled = !redoN; $('#plan-redo-n').textContent = redoN ? ` ${redoN}` : ''; }
+}
+
+function flashSaveChip(msg) {
+  const chip = $('#plan-save-chip'), txt = $('#plan-save-txt');
+  if (!chip || !txt) return;
+  txt.textContent = msg;
+  chip.classList.remove('saving');
+  void chip.offsetWidth; // 애니메이션 재시작
+  chip.classList.add('saving');
+  renderPlanProvenance();
+}
+
+function renderPlanProvenance() {
+  const el = $('#plan-provenance');
+  const store = state.store;
+  if (!el || !store) return;
+  const persistence = store.remoteStatus === 'synced'
+    ? '서버 동기화'
+    : store.remoteStatus === 'local-only' ? '브라우저 로컬 폴백' : '서버 연결 확인 중';
+  const mission = state.mission;
+  const missionLabel = mission
+    ? `${mission.name} · ${missionFingerprint(mission)}`
+    : '시나리오 미지정';
+  el.textContent = `저장: ${persistence} · 계약 gp-digital-twin.plan v2 · 지형: Cesium 런타임 · 시나리오: ${missionLabel}`;
+}
+
+/** 도면 미리보기 모달 — 렌더 → 확대 미리보기 → 다운로드 */
+let _bpResult = null;
+function openBlueprintModal() {
+  if (!state.placer.items.length) { toast('배치된 시설이 없습니다 — 먼저 시설을 배치하세요'); return; }
+  setLoading(true, '배치계획도 작도 중…');
+  setTimeout(() => {
+    _bpResult = renderBlueprint({
+      placer: state.placer,
+      towerHeight: state.ents.towerHeight,
+      towerCostKrw: towerCostEok(state.ents.towerHeight) * EOK,
+      ipbItems: state.ipb.items,
+    });
+    setLoading(false);
+    const wrap = $('#bp-canvas-wrap');
+    wrap.innerHTML = '';
+    _bpResult.canvas.style.width = '100%';
+    _bpResult.canvas.style.height = 'auto';
+    wrap.appendChild(_bpResult.canvas);
+    $('#bp-meta').textContent =
+      `A3 가로 · 축척 1:${_bpResult.scaleDenom} · 시설 ${_bpResult.items}동 · ${_bpResult.dateStr}`;
+    $('#bp-modal').classList.remove('hidden');
+  }, 30);
+}
+
+// ═════════════ ②-A AI 배치 설계 (Scaffolda aiPlacement 이식) ═════════════
+const ai = {
+  history: [createDesignSystemPrompt()],   // MAX 10 유지 (system 제외)
+  requirements: null,
+  askedIds: new Set(),
+  pendingQuestions: [],
+  awaitingAnswer: false,
+  busy: false,
+  msgSeq: 0,
+};
+const MAX_HISTORY_MESSAGES = 10;
+function trimHistory(list) {
+  const [sys, ...rest] = list;
+  return [sys, ...rest.slice(-MAX_HISTORY_MESSAGES)];
+}
+
+function aiPush(author, html) {
+  const box = $('#ai-chat');
+  if (!box) return null;
+  const el = document.createElement('div');
+  el.className = 'ai-msg';
+  el.dataset.author = author;
+  el.innerHTML = html;
+  box.appendChild(el);
+  while (box.children.length > 12) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+  return el;
+}
+
+function aiPushThinking() {
+  return aiPush('ai', '<span class="ai-spinner"></span>생각 중…');
+}
+
+/** 대기 큐에서 미답 질문 1개를 칩으로 노출 (원본 showNextQuestion) */
+function aiShowNextQuestion() {
+  while (ai.pendingQuestions.length > 0) {
+    const id = ai.pendingQuestions.shift();
+    const question = findQuestion(id);
+    if (!question || ai.askedIds.has(id)) continue;
+    ai.askedIds.add(id);
+    const mid = `aiq-${++ai.msgSeq}`;
+    aiPush('ai', `${question.text}<div class="ai-chips" id="${mid}">${question.options.map((o, i) =>
+      `<button class="ai-chip" data-qi="${i}">${o.label}${o.recommended ? ' (추천)' : ''}</button>`).join('')}</div>`);
+    ai.history = trimHistory([...ai.history, { role: 'assistant', content: question.text }]);
+    $(`#${mid}`).querySelectorAll('.ai-chip').forEach((chip) => {
+      chip.onclick = () => aiAnswerQuestion(mid, question, +chip.dataset.qi);
+    });
+    return;
+  }
+}
+
+/** 칩 답변: 결정론 효과 적용 → 즉시 재배치 → 다음 질문 (원본 answerQuestion) */
+async function aiAnswerQuestion(mid, question, optionIndex) {
+  if (ai.busy || !ai.requirements) return;
+  const option = question.options[optionIndex];
+  const wrap = $(`#${mid}`);
+  if (wrap) {
+    wrap.querySelectorAll('.ai-chip').forEach((c, i) => {
+      c.dataset.selected = String(i === optionIndex);
+      c.disabled = true;
+    });
+  }
+  ai.history = trimHistory([...ai.history, { role: 'user', content: `${question.text} → ${option.label}` }]);
+  ai.requirements = applyQuestionAnswer(ai.requirements, question.id, optionIndex);
+  ai.awaitingAnswer = false;
+  ai.busy = true;
+  const spinner = aiPushThinking();
+  try {
+    await aiApplyPlacement(ai.requirements);
+    aiShowNextQuestion();
+  } catch (error) {
+    aiPush('system', error instanceof AiPlacementError ? error.userMessage : `배치 실패: ${error.message}`);
+  } finally {
+    spinner?.remove();
+    ai.busy = false;
+  }
+}
+
+/** 배치 실행: 결정론 엔진 → placer 순차 배치(각 지형 비용 산출) (원본 applyPlacement) */
+async function aiApplyPlacement(requirements) {
+  await new Promise((r) => setTimeout(r, 0));
+  const result = await generatePlacement(state.viewer, requirements, state.realTerrain);
+  state.lastPlacement = result;   // 평가보고서의 「배치최적화」 절이 이 산출물을 읽는다
+  if (!result.placements.length) {
+    aiPush('system', [...result.warnings, ...result.notes].join(' ') || '배치를 생성하지 못했습니다.');
+    return;
+  }
+  // 기존 AI 배치 철거 후 재배치
+  [...state.placer.items].forEach((i) => state.placer.remove(i.uid));
+  let placed = 0;
+  let costSum = 0;
+  // place() 는 성공하면 item 을, 검증에 걸리면 {blocked: 사유} 를 준다 — 둘을 섞으면
+  // 차단된 자리에서 it.cost 를 읽다가 턴 전체가 죽는다(배치가 중간에 끊긴다).
+  const blocked = [];
+  for (const p of result.placements) {
+    setLoading(true, `배치 ${placed + 1}/${result.placements.length} — ${p.unit.label} 지형 비용 산출…`);
+    const it = await state.placer.place(p.unit.facilityTypeId, p.lon, p.lat, {
+      capacity: Math.max(1, p.unit.personnel), floors: p.floors,
+    }).catch((error) => {
+      console.warn('[ai] 배치 실패', p.unit.label, error);
+      return { blocked: error?.message ?? '배치 실패' };
+    });
+    if (it && !it.blocked) { placed++; costSum += it.cost.totalKrw; }
+    else if (it?.blocked) blocked.push(`${p.unit.label}(${it.blocked})`);
+  }
+  setLoading(false);
+  const req = requirements;
+  aiPush('system',
+    `배치 ${placed}/${result.placements.length}동 완료 · 총 배치점수 ${result.totalScore}(낮을수록 좋음) · 공사비 ${fmtKrw(costSum)}` +
+    (blocked.length ? ` · ⛔ 배치 불가 ${blocked.length}동: ${blocked.slice(0, 3).join(', ')}` : '') +
+    (result.warnings.length ? ` · ⚠ ${result.warnings.join(' ')}` : '') +
+    (req.assumed.length ? ` · ${req.assumed.join(', ')}` : ''));
+  // 모듈 카드
+  aiPush('ai', `<div class="ai-req-table">${UNIT_TEMPLATE_LABELS[req.unitTemplate]} · 총원 ${req.totalPersonnel} · 상주 ${req.residentPersonnel}<br>` +
+    Object.entries(req.modules).map(([id, m]) =>
+      `${MODULE_LABELS[id]} ${m.enabled ? (m.weight === 1 ? '보통' : m.weight === 0.5 ? '적게' : '많이') : 'OFF'}`).join(' · ') + '</div>');
+  aiPush('ai', '작업이 완료되었습니다');
+  flyTo(state.viewer, SITE.gp.lon, SITE.gp.lat - 0.0055, state.ents.groundH + 460, 0, -40, 1.8);
+  refreshPlacedList();
+}
+
+/**
+ * 로컬 Ollama 가 아예 안 뜬 상태로 두면 requestDesignTurn 의 fetch 가 응답도 에러도 없이
+ * 영영 걸린다 — AiPlacementError 도 안 던지니 아래 catch 의 오프라인 폴백을 못 타고
+ * 「생각 중…」에서 화면이 죽는다. 그래서 여기서 클라이언트 쪽 시간제한을 건다.
+ * (진 쪽 fetch 는 계속 떠 있지만 아무도 기다리지 않으니 사용자에게는 무해하다.)
+ */
+const AI_TURN_TIMEOUT_MS = 20000;
+function aiTimeoutGuard(ms) {
+  return new Promise((_, reject) => setTimeout(() => {
+    const e = new Error(`응답이 ${Math.round(ms / 1000)}초 안에 오지 않았습니다`);
+    e.isAiTimeout = true;
+    reject(e);
+  }, ms));
+}
+
+/** 사용자 입력 1턴 (원본 handleSend — 질문 턴 배치 보류 게이트 포함) */
+async function aiHandleSend() {
+  const input = $('#ai-input');
+  const text = input?.value.trim();
+  if (!text || ai.busy) return;
+  input.value = '';
+  aiPush('user', text);
+  ai.history = trimHistory([...ai.history, { role: 'user', content: text }]);
+  ai.busy = true;
+  const spinner = aiPushThinking();
+  try {
+    let turn;
+    try {
+      turn = await Promise.race([requestDesignTurn(ai.history), aiTimeoutGuard(AI_TURN_TIMEOUT_MS)]);
+    } catch (error) {
+      if (error instanceof AiPlacementError || error?.isAiTimeout) {
+        // 미가동·응답불량·시간초과 전부 오프라인 규칙 파서로 데모를 이어간다 (Scaffolda 외 추가)
+        aiPush('system', (error.userMessage ?? error.message) + ' → 오프라인 규칙 파서로 진행합니다.');
+        turn = parseOffline(text);
+      } else throw error;
+    }
+    if (turn.reply) {
+      aiPush('ai', turn.reply);
+      ai.history = trimHistory([...ai.history, { role: 'assistant', content: turn.reply }]);
+    }
+    const merged = mergeTurnRequirements(ai.requirements, turn);
+    ai.pendingQuestions.push(...turn.askQuestionIds.filter((id) => !ai.askedIds.has(id)));
+    const changed = ai.requirements === null || JSON.stringify(merged) !== JSON.stringify(ai.requirements);
+    ai.requirements = merged;
+    const asksQuestion = ai.pendingQuestions.length > 0 || (turn.reply ? isInterrogativeText(turn.reply) : false);
+    if (asksQuestion) {
+      ai.awaitingAnswer = ai.awaitingAnswer || changed;
+    } else if (changed || ai.awaitingAnswer) {
+      ai.awaitingAnswer = false;
+      await aiApplyPlacement(merged);
+    }
+    aiShowNextQuestion();
+  } catch (error) {
+    aiPush('system', error instanceof AiPlacementError ? error.userMessage : `오류: ${error.message}`);
+  } finally {
+    spinner?.remove();
+    ai.busy = false;
+  }
+}
+
+// ═════════════ ② 배치 ═════════════
+const facilityFilters = { query: '', category: '', placedQuery: '', sort: 'added' };
+const facilityCategoryLabels = {
+  command: '지휘·업무', care: '의료', living: '생활·복지', logistics: '보관·정비',
+  infrastructure: '기반시설', training: '교육·훈련', vehicle: '차량', entry: '출입', other: '기타',
+};
+
+function filterFacilityCatalog() {
+  const query = facilityFilters.query.trim().toLocaleLowerCase();
+  let count = 0;
+  $$('#cat-list .cat-item').forEach((row) => {
+    const spec = FACILITY_CATALOG.find((f) => f.id === row.dataset.spec);
+    const matches = (!facilityFilters.category || spec.category === facilityFilters.category)
+      && `${spec.name} ${spec.desc ?? ''} ${spec.id}`.toLocaleLowerCase().includes(query);
+    row.hidden = !matches;
+    if (matches) count++;
+  });
+  $('#cat-results').textContent = `${count} / ${FACILITY_CATALOG.length}종`;
+  $('#cat-empty').hidden = count > 0;
+  $('#cat-reset').disabled = !facilityFilters.query && !facilityFilters.category;
+}
+
+function exportFacilitySchedule() {
+  const items = state.placer.items;
+  if (!items.length) { toast('배치된 시설이 없습니다'); return; }
+  const rows = [
+    ['시설명', '동수', '정원(인)', '층수', '바닥면적(㎡)', '절토(㎥)', '성토(㎥)', '시설 추정비용(원)', '비고'],
+    ...items.map((it) => [it.spec.name, 1, it.capacity, it.floors, it.dims.areaM2,
+      it.cost.cutM3, it.cost.fillM3, it.cost.totalKrw, '개략 추정 · 타워/설계/인허가 제외']),
+  ];
+  const cell = (value) => {
+    const text = typeof value === 'number' ? (Number.isFinite(value) ? String(Math.round(value * 100) / 100) : '') : String(value);
+    const safe = /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+    return `"${safe.replaceAll('"', '""')}"`;
+  };
+  const blob = new Blob(['\uFEFF' + rows.map((row) => row.map(cell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `facility-schedule-${new Date().toISOString().slice(0, 10)}.csv`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(`시설 ${items.length}동의 수량·추정비용을 CSV로 내보냈습니다`);
+}
+
+function renderBuildTab() {
+  $('#page-build').innerHTML = `
+    ${state.training?.appliedPlan ? `<div class="sec training-applied-sec"><div class="sec-title">훈련근거 적용 계획 <span class="training-mock">목업 근거</span></div>
+      <div class="training-applied-head"><b>${state.training.appliedPlan.hotspot?.id ?? ''} · ${state.training.appliedPlan.hotspot?.label ?? ''}</b><span>${state.training.appliedPlan.placedNeedIds?.length ?? 0}/${state.training.appliedPlan.needs?.length ?? 0}개 기능 적용</span></div>
+      <p class="muted">${state.training.appliedPlan.fingerprint ?? ''} · 선택 후보는 기존 지형 샘플·배치 검증·토공비 산식을 통과하도록 재계산됩니다.</p>
+      <button class="btn full" id="training-return">훈련근거·후보 다시 보기 ←</button></div>` : ''}
+    <div class="sec"><div class="sec-title">AI 배치 설계 (로컬 Ollama · ${OLLAMA_MODEL || '미가동'})</div>
+      <p class="muted" style="margin-bottom:6px">Scaffolda 방식: <b>LLM은 요구사항 추출과 질문 선택만</b> 하고,
+      좌표·배치는 결정론 엔진(경사 w4 · 상대고도 w3 · 친화 40/80/100m · 출입 150m 클리어)이 계산.
+      배치마다 지형 샘플로 실비용 산출.</p>
+      <div id="ai-chat"></div>
+      <div class="ai-input-row">
+        <input id="ai-input" type="text" placeholder='예: "교대근무 12명 GP 지어줘"'>
+        <button class="btn primary" id="ai-send">전송</button>
+      </div></div>
+    <div class="sec"><div class="sec-title">시설 카탈로그 — 지도로 드래그</div>
+      <p class="muted" style="margin-bottom:6px">Scaffolda 국방시설 카탈로그(4평/인 원단위).
+      끌어다 놓으면 그 자리 지형을 2m 격자 샘플링해 <b>절토·성토·옹벽·기초·건물비</b>를 즉시 산출 —
+      능선 급사면에 놓으면 토공사비가 뛴다.</p>
+      <div class="facility-tools">
+        <input id="cat-search" type="search" aria-label="시설 검색" placeholder="시설명 검색 (예: 생활, 의료, 창고)">
+        <select id="cat-category" aria-label="시설 분류"><option value="">모든 분류</option></select>
+      </div>
+      <div class="facility-results"><span id="cat-results" role="status" aria-live="polite"></span><button class="btn" id="cat-reset">필터 초기화</button></div>
+      <div id="cat-list"></div>
+      <p id="cat-empty" class="facility-empty" hidden>일치하는 시설이 없습니다. 검색어를 바꾸거나 필터를 초기화하세요.</p></div>
+    <div class="sec"><div class="sec-title">배치된 시설 <span class="muted" id="placed-count"></span></div>
+      <div class="facility-tools">
+        <input id="placed-search" type="search" aria-label="배치된 시설 검색" placeholder="배치된 시설 찾기">
+        <select id="placed-sort" aria-label="시설 정렬"><option value="added">배치 순서</option><option value="cost-desc">비용 높은 순</option><option value="cost-asc">비용 낮은 순</option><option value="name">이름순</option></select>
+      </div>
+      <p class="muted" id="placed-results" role="status" aria-live="polite"></p>
+      <div id="placed-list"><p class="muted">아직 없음 — 카탈로그에서 끌어다 놓으세요.</p></div>
+      <button class="btn full" id="facility-csv">시설 수량·추정비용 CSV 내려받기</button>
+      <p class="muted">전체 배치 시설을 내보냅니다. 타워·설계·인허가 비용은 제외됩니다.</p>
+      <div class="btn-row">
+        <button class="btn" id="rotate-sel" disabled>선택 회전 45°</button>
+        <button class="btn" id="clear-all">전체 철거</button>
+      </div>
+      <p class="muted" style="margin-top:4px">지도에서 건물 클릭=선택, 클릭한 채 드래그=이동, Delete=철거.</p></div>
+    <div class="sec"><div class="sec-title">부지 종합 진단</div>
+      <p class="muted" style="margin-bottom:6px">현재 배치를 토목·시설배치 교리로 채점합니다 —
+      <b>위험물 이격 · 의무 후송(MEDEVAC) · C2 근접 · 토공량 · 건축적지 활용</b>. (GP 정밀지형 필요)</p>
+      <button class="btn full" id="site-diagnose">◈ 종합 진단 실행 ▶</button>
+      <div id="diag-out"></div></div>
+    <div class="sec"><div class="sec-title">자동 배치</div>
+      <button class="btn full" id="auto-layout">◈ 표준 GP 세트 자동배치 (10종·역할 기반) ▶</button>
+      <p class="muted" style="margin-top:4px">전방위 120개 후보를 지형 샘플링해 10종 시설을 역할대로 배치 —
+      전방 초소는 능선, 위병소는 후방 접근로, 탄약고는 생활동 50m+ 이격, 위생·복지·의무는 생활동 인접.
+      완료 시 동선 도로망이 함께 그려집니다. 기존 배치는 유지한 채 추가됩니다.</p></div>
+    <div class="sec"><div class="sec-title">계획 관리 (SitePlan)</div>
+      <div class="plan-stats" id="plan-stats"></div>
+      <div class="plan-toolbar">
+        <button class="btn" id="plan-undo" title="실행취소 (Ctrl+Z)" disabled>↶<span id="plan-undo-n"></span></button>
+        <button class="btn" id="plan-redo" title="다시실행 (Ctrl+Y)" disabled>↷<span id="plan-redo-n"></span></button>
+        <span class="plan-save-chip" id="plan-save-chip"><span class="save-dot"></span><span id="plan-save-txt">저장됨</span></span>
+        <button class="btn" id="plan-load" title="저장본 불러오기">⟲</button>
+        <button class="btn" id="plan-export" title="계획 파일(.gpplan.json)로 내보내기">⬇</button>
+        <button class="btn" id="plan-import" title="계획 파일 가져오기">⬆</button>
+        <button class="btn" id="plan-reset" title="계획 초기화">${svgIcon('trash')}</button>
+      </div>
+      <input type="file" id="plan-file" accept=".json,.gpplan.json,application/json" hidden>
+      <p class="muted" id="plan-provenance" style="margin:4px 0 0">저장 범위 확인 중…</p>
+      <button class="btn primary full" id="plan-blueprint">${svgIcon('ruler')} A3 배치계획도 미리보기</button>
+      <button class="btn full" id="plan-report">${svgIcon('printer')} 작전계획 종합 보고서 (인쇄/저장)</button>
+      <p class="muted" style="margin-top:4px">Ctrl+Z/Y 실행취소 · Ctrl+C/V 복사·붙여넣기 · Delete 철거 · Esc 선택해제</p></div>
+    <div class="sec"><div class="sec-title">계획안 슬롯 — 안(案) 비교</div>
+      <div class="slot-row">
+        <input id="slot-name" type="text" maxlength="24" placeholder="계획안 이름 (예: 1안 능선집중)" />
+        <button class="btn" id="slot-save">저장</button>
+      </div>
+      <div id="slot-list"></div>
+      <div id="slot-compare"></div>
+      <p class="muted" style="margin-top:4px"><b>⇄</b> 를 누르면 현재 배치와 그 안을 항목별로 나란히 놓습니다
+      (비교만으로는 배치가 바뀌지 않습니다). <b>열기</b> 로 전환하며, 열기 전 현 배치는 Ctrl+Z로 복귀 가능합니다.</p></div>
+    <div class="sec"><div class="sec-title">시설 상세 설정 (인스펙터)</div><div id="inspector"></div></div>
+    <div class="sec"><div class="sec-title">선택 시설 비용 내역 (Scaffolda 산식)</div><div id="cost-breakdown"></div></div>
+    <div class="sec"><div class="sec-title">총사업비 (Scaffolda projectCost)</div><div id="project-cost"></div></div>
+    <div class="cost-total"><span class="ct-label">총사업비 (타워+공사+설계+인허가)</span><span class="ct-val" id="cost-total-val">—</span></div>`;
+
+  $('#cat-list').innerHTML = FACILITY_CATALOG.map((f) => {
+    const d = createRecommendedZoneDimensions(f.capacity);
+    return `<div class="cat-item" draggable="true" data-spec="${f.id}">
+      <span class="c-chip" style="background:${f.color}"></span>
+      <span class="c-name">${f.name}${f.protection === 'hardened' ? ' <span style="color:var(--warn)" title="방호시설 (×4.2)">⛨</span>' : ''}</span>
+      <span class="c-meta">${f.capacity}인 · ${f.floors}층<br>${d.widthM}×${d.depthM}m</span>
+    </div>`;
+  }).join('');
+  $('#training-return')?.addEventListener('click', () => switchTab('training'));
+  $$('#cat-list .cat-item').forEach((el) => {
+    el.addEventListener('dragstart', (e) => {
+      state.dragSpecId = el.dataset.spec;
+      e.dataTransfer.setData('text/plain', el.dataset.spec);
+      e.dataTransfer.effectAllowed = 'copy';
+      $('#drop-hint')?.classList.add('active');
+    });
+    el.addEventListener('dragend', () => $('#drop-hint')?.classList.remove('active'));
+  });
+  for (const category of [...new Set(FACILITY_CATALOG.map((f) => f.category))]) {
+    $('#cat-category').add(new Option(facilityCategoryLabels[category] ?? category, category));
+  }
+  $('#cat-search').value = facilityFilters.query;
+  $('#cat-category').value = facilityFilters.category;
+  $('#cat-search').oninput = (e) => { facilityFilters.query = e.target.value; filterFacilityCatalog(); };
+  $('#cat-category').onchange = (e) => { facilityFilters.category = e.target.value; filterFacilityCatalog(); };
+  $('#cat-reset').onclick = () => {
+    facilityFilters.query = facilityFilters.category = '';
+    $('#cat-search').value = $('#cat-category').value = '';
+    filterFacilityCatalog();
+    $('#cat-search').focus();
+  };
+  $('#placed-search').value = facilityFilters.placedQuery;
+  $('#placed-sort').value = facilityFilters.sort;
+  $('#placed-search').oninput = (e) => { facilityFilters.placedQuery = e.target.value; refreshPlacedList(); };
+  $('#placed-sort').onchange = (e) => { facilityFilters.sort = e.target.value; refreshPlacedList(); };
+  $('#facility-csv').onclick = exportFacilitySchedule;
+  filterFacilityCatalog();
+  refreshPlacedList();
+  armDestructive($('#clear-all'), `배치 시설 ${state.placer.items.length}동을 전부 철거합니다`, () => {
+    const n = state.placer.items.length;
+    [...state.placer.items].forEach((i) => state.placer.remove(i.uid));
+    state.roadsDs?.entities.removeAll();
+    toast(`${n}동 철거 — Ctrl+Z 로 되돌릴 수 있습니다`, 4200);
+  });
+  $('#rotate-sel').onclick = () => {
+    const it = state.placer.items.find((i) => i.uid === state.placer.selectedUid);
+    if (it) { it.headingDeg = (it.headingDeg + 45) % 360; state.placer._draw(it); }
+  };
+  $('#auto-layout').onclick = autoLayout;
+  $('#site-diagnose').onclick = renderDiagnostics;
+  // 계획 관리 배선
+  $('#plan-undo').onclick = () => toast(state.store.undo() ? '실행 취소' : '되돌릴 작업이 없습니다');
+  $('#plan-redo').onclick = () => toast(state.store.redo() ? '다시 실행' : '다시 실행할 작업이 없습니다');
+  $('#plan-load').onclick = () => {
+    const snap = state.store.loadSaved();
+    if (!snap) { toast('저장된 계획이 없습니다'); return; }
+    state.store.applySnapshot(snap);
+    toast(`저장본 복원 — 시설 ${snap.items?.length ?? 0}동 · 타워 ${snap.towerHeight}m (${snap.updatedAt?.slice(0, 16).replace('T', ' ')})`);
+  };
+  // 저장본까지 지운다 — 이건 Ctrl+Z 로도 안 돌아온다. 두 번 눌러야 하는 이유.
+  armDestructive($('#plan-reset'), '계획과 저장본(서버 사본 포함)을 지웁니다', () => {
+    state.store.applySnapshot({ towerHeight: 18, items: [], ipb: [] });
+    state.store.clearSaved();
+    toast('계획을 초기화했습니다 (저장본 삭제)');
+  });
+  // ─── 계획 파일 내보내기·가져오기 ───
+  // GeoJSON 은 남에게 「보여 주는」 형식이라 되돌릴 수 없다(시설 제원·비용·타워고가 없다).
+  // 계획 자체를 주고받으려면 서버와 같은 계약(gp-digital-twin.plan v2)을 그대로 파일로 낸다.
+  $('#plan-export').onclick = () => {
+    const snap = state.store.serialize();
+    const blob = new Blob([JSON.stringify(snap, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `gp-digital-twin-plan-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.gpplan.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast(`계획 파일 내보내기 — 시설 ${snap.items.length}동 · 타워 ${snap.towerHeight}m `
+      + `(${PLAN_SCHEMA} v${PLAN_SCHEMA_VERSION})`, 4600);
+  };
+  $('#plan-import').onclick = () => $('#plan-file').click();
+  $('#plan-file').onchange = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';                       // 같은 파일을 다시 골라도 change 가 오도록
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      const check = validatePlanSnapshot(parsed);
+      if (!check.ok) {
+        toast(`계획 파일이 아닙니다 — ${check.errors.slice(0, 2).join(' · ')}`, 5200);
+        return;
+      }
+      const snap = normalizePlanSnapshot(parsed, { source: 'file' });
+      // 히스토리에 넣어 들여온 뒤에도 Ctrl+Z 로 원래 배치로 돌아갈 수 있게 한다.
+      state.store.applySnapshotWithHistory(snap);
+      toast(`계획 파일 적용 — 시설 ${snap.items.length}동 · 전술도식 ${snap.ipb.length}개 `
+        + `· 타워 ${snap.towerHeight}m (Ctrl+Z 로 복귀)`, 6000);
+    } catch (error) {
+      console.warn('[plan] 가져오기 실패', error);
+      toast(`가져오기 실패: ${error.message}`, 4600);
+    }
+  };
+
+  $('#plan-blueprint').onclick = openBlueprintModal;
+  $('#plan-report').onclick = openOperationReport;
+  // 계획안 슬롯 배선
+  $('#slot-save').onclick = () => {
+    const name = $('#slot-name').value.trim();
+    if (!name) { toast('계획안 이름을 입력하세요'); $('#slot-name').focus(); return; }
+    if (!state.placer.items.length) { toast('저장할 배치가 없습니다'); return; }
+    state.store.saveSlot(name);
+    $('#slot-name').value = '';
+    renderSlotList();
+    toast(`계획안 「${name}」 저장 — 시설 ${state.placer.items.length}동`);
+  };
+  $('#slot-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#slot-save').click(); });
+  renderSlotList();
+  renderPlanStats();
+  // AI 챗 배선 (탭 재렌더 시 인사말 1회)
+  $('#ai-send').onclick = aiHandleSend;
+  $('#ai-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') aiHandleSend(); });
+  if (!ai._greeted) { ai._greeted = true; aiPush('ai', GREETING); }
+}
+
+/** 표준 GP 세트 자동배치 v2 — 전 방위 후보 지형 샘플 → 역할 기반 복합 스코어 greedy */
+/** 부지 종합 진단 — 배치를 토목·교리 기준으로 채점해 #diag-out 에 렌더 */
+function renderDiagnostics() {
+  const out = $('#diag-out');
+  if (!out) return;
+  if (state.realTerrain?.mode !== 'gp') {
+    out.innerHTML = '<p class="muted" style="margin-top:8px">GP 정밀지형을 먼저 켜세요 — 지형 접지·경사 데이터가 필요합니다.</p>';
+    return;
+  }
+  const r = diagnoseSite(state.placer);
+  if (!r.ready) { out.innerHTML = `<p class="muted" style="margin-top:8px">${r.reason}</p>`; return; }
+  const m = r.metrics;
+  const sevColor = { high: '#ed5d5d', med: '#e3b341', low: '#8aa0b6' };
+  const sevIcon = { high: '●', med: '▲', low: '·' };
+  const findings = r.findings.map((f) =>
+    `<div class="diag-find"><span style="color:${sevColor[f.sev]}">${sevIcon[f.sev]}</span> ${f.text}</div>`).join('');
+  out.innerHTML = `
+    <div class="diag-score" style="border-color:${r.grade.color}">
+      <div class="diag-grade" style="color:${r.grade.color}">${r.grade.letter}</div>
+      <div><div class="diag-num">${r.score}<span>/100</span></div>
+        <div class="muted">${r.grade.label} · 시설 ${m.count}동</div></div>
+    </div>
+    <div class="diag-kv">
+      <span>건축적지</span><b>양호 ${m.nEasy} / 정지 ${m.nGrade} / 부적합 ${m.nUnfit}</b>
+      <span>총 성토량</span><b>${m.fillTot.toLocaleString()}㎥</b>
+      <span>최대 옹벽고</span><b>${m.wallMax}m</b>
+      <span>접근로 연장</span><b>${m.roadTotalM.toLocaleString()}m</b>
+      <span>도보전용 구간</span><b>${m.footEdges}/${m.edgeCount}</b>
+      <span>위험물 이격위반</span><b style="color:${m.sepViol ? '#ed5d5d' : 'inherit'}">${m.sepViol}건</b>
+    </div>
+    <div class="diag-sub">개선 소견 (${r.findings.length})</div>
+    <div class="diag-finds">${findings}</div>`;
+}
+
+async function autoLayout() {
+  setLoading(true, '부지 전방위 지형 샘플링 (120개 후보)…');
+  const cands = [];
+  for (let az = 0; az < 360; az += 15) {
+    for (const d of [38, 58, 80, 105, 130]) {
+      const p = offset(SITE.gp.lon, SITE.gp.lat, az, d);
+      cands.push({ ...p, az, d });
+    }
+  }
+  // 각 후보: 중심+4방 8m 오프셋 5점 샘플 → 국소 경사 추정
+  const cartos = [];
+  for (const c of cands) {
+    cartos.push(Cesium.Cartographic.fromDegrees(c.lon, c.lat));
+    for (const a of [0, 90, 180, 270]) {
+      const q = offset(c.lon, c.lat, a, 8);
+      cartos.push(Cesium.Cartographic.fromDegrees(q.lon, q.lat));
+    }
+  }
+  try { await sampleTerrainDetailed(state.viewer.terrainProvider, cartos); } catch (e) { console.warn(e); }
+  cands.forEach((c, i) => {
+    const base = cartos[i * 5].height ?? 0;
+    let maxDh = 0;
+    for (let k = 1; k <= 4; k++) maxDh = Math.max(maxDh, Math.abs((cartos[i * 5 + k].height ?? base) - base));
+    c.slopeDeg = Math.atan2(maxDh, 8) * 180 / Math.PI;
+    c.h = base;
+  });
+  // 역할 기반 복합 스코어 greedy (facilityScore v2):
+  //  경사 + 후사면 은폐 + 지휘 타워근접 / 위생·복지·의무 생활동 인접 / 탄약고 안전이격 ≥50m
+  //  + 전방 초소(관측 노출 우선) + 위병소(후방 허브 접근로 회랑) — 10종 전체 세트
+  const PROGRAM = [
+    'command-zone', 'living-zone', 'hygiene-zone', 'welfare-zone', 'medical-zone',
+    'infrastructure-zone', 'storage-zone', 'maintenance-zone', 'security-zone', 'entry-zone',
+  ];
+  const gpH = state.ents.groundH;
+  const ctx = { hubAz: azimuthDeg(SITE.gp.lon, SITE.gp.lat, SITE.hub.lon, SITE.hub.lat) };
+  const chosen = [];
+  const placedSoFar = [];
+  let placed = 0;
+  for (const specId of PROGRAM) {
+    const spec = FACILITY_CATALOG.find((s) => s.id === specId);
+    const need = createRecommendedZoneDimensions(spec.capacity);
+    const minGap = Math.max(need.widthM, need.depthM) + 8;
+    // 후보 전체를 스코어 순으로 랭킹 → place() 차단/실패 시 차순위 재시도
+    const ranked = cands
+      .filter((c) => !chosen.some((x) => distLL(x, c) < minGap))
+      .map((c) => ({ ...c, score: facilityScore(specId, c, gpH, placedSoFar, ctx) }))
+      .filter((c) => c.score !== -Infinity && Number.isFinite(c.score))
+      .sort((a, b) => b.score - a.score);
+    setLoading(true, `${spec.name} 최적 부지 배치 중… (${placed + 1}/${PROGRAM.length})`);
+    for (const c of ranked.slice(0, 8)) {
+      const it = await state.placer.place(specId, c.lon, c.lat, { headingDeg: Math.round(c.az / 15) * 15 % 360 })
+        .catch((e) => { console.warn('autoLayout place throw', specId, e); return null; });
+      // place()는 검증 차단 시 {blocked: 사유}를 반환 — 성공(실제 item)과 구분해 차순위 재시도
+      if (it && !it.blocked) {
+        placed++;
+        chosen.push(c);
+        placedSoFar.push({ id: specId, lon: c.lon, lat: c.lat, uid: it.uid });
+        break;
+      }
+      if (it?.blocked) console.info('autoLayout 후보 차단:', spec.name, it.blocked);
+    }
+  }
+  // 동선망은 이번에 놓은 것만이 아니라 **지금 부지에 서 있는 전부**를 잇는다 —
+  // 자동배치를 두 번 돌리면 앞 배치가 도로에서 빠져 유령 건물이 되던 문제.
+  drawSiteRoads(
+    state.placer.items.map((it) => ({ id: it.spec.id, lon: it.lon, lat: it.lat, uid: it.uid })),
+    ctx.hubAz,
+  );
+  setLoading(false);
+  flyTo(state.viewer, SITE.gp.lon, SITE.gp.lat - 0.0045, state.ents.groundH + 380, 0, -38, 1.6);
+  const defAvg = chosen.length
+    ? (chosen.reduce((s, c) => s + Math.max(0, gpH - c.h), 0) / chosen.length).toFixed(0) : 0;
+  toast(`자동배치 완료 — ${placed}/${PROGRAM.length}동 (역할 스코어 · 평균 능선차폐 −${defAvg}m · 안전이격/인접성/접근회랑 반영 · 동선망 표시)`, 5600);
+}
+
+/** 부지 동선망 — 위병소(게이트)를 뿌리로 한 최소신장트리(Prim) 도로 폴리라인 */
+function drawSiteRoads(placedSoFar, hubAz) {
+  if (!state.roadsDs) {
+    state.roadsDs = new Cesium.CustomDataSource('site-roads');
+    state.viewer.dataSources.add(state.roadsDs);
+  }
+  state.roadsDs.entities.removeAll();
+  if (placedSoFar.length < 2) return;
+  const nodes = [...placedSoFar.map((p) => ({ lon: p.lon, lat: p.lat }))];
+  nodes.push({ lon: SITE.gp.lon, lat: SITE.gp.lat });               // 감시탑도 연결
+  const rootIdx = placedSoFar.findIndex((p) => p.id === 'entry-zone');
+  const inTree = new Set([rootIdx >= 0 ? rootIdx : 0]);
+  const edges = [];
+  while (inTree.size < nodes.length) {
+    let best = null;
+    for (const i of inTree) {
+      for (let j = 0; j < nodes.length; j++) {
+        if (inTree.has(j)) continue;
+        const d = distM(nodes[i].lon, nodes[i].lat, nodes[j].lon, nodes[j].lat);
+        if (!best || d < best.d) best = { i, j, d };
+      }
+    }
+    if (!best) break;
+    inTree.add(best.j);
+    edges.push(best);
+  }
+  const css = (c) => Cesium.Color.fromCssColorString(c);
+  edges.forEach((e, k) => {
+    state.roadsDs.entities.add({
+      id: `site-road-${k}`,
+      polyline: {
+        positions: Cesium.Cartesian3.fromDegreesArray([
+          nodes[e.i].lon, nodes[e.i].lat, nodes[e.j].lon, nodes[e.j].lat]),
+        width: 5, clampToGround: true,
+        material: new Cesium.PolylineDashMaterialProperty({
+          color: css('#d9c9a3').withAlpha(0.85), dashLength: 22,
+        }),
+      },
+    });
+  });
+  // 게이트 진입 화살 (위병소 → 허브 방향 60m)
+  if (rootIdx >= 0) {
+    const g = nodes[rootIdx];
+    const out = offset(g.lon, g.lat, hubAz, 60);
+    state.roadsDs.entities.add({
+      id: 'site-road-approach',
+      polyline: {
+        positions: Cesium.Cartesian3.fromDegreesArray([g.lon, g.lat, out.lon, out.lat]),
+        width: 7, clampToGround: true,
+        material: new Cesium.PolylineArrowMaterialProperty(css('#d9c9a3').withAlpha(0.9)),
+      },
+    });
+  }
+}
+
+function distLL(a, b) {
+  const dx = (a.lon - b.lon) * 111320 * Math.cos(a.lat * Math.PI / 180);
+  const dy = (a.lat - b.lat) * 111320;
+  return Math.hypot(dx, dy);
+}
+
+function refreshPlacedList() {
+  const el = $('#placed-list');
+  if (!el) return;
+  $('#placed-count').textContent = `${state.placer.items.length}동`;
+  const query = facilityFilters.placedQuery.trim().toLocaleLowerCase();
+  const visibleItems = state.placer.items.filter((item) => item.spec.name.toLocaleLowerCase().includes(query));
+  if (facilityFilters.sort === 'name') visibleItems.sort((a, b) => a.spec.name.localeCompare(b.spec.name, 'ko'));
+  if (facilityFilters.sort === 'cost-desc') visibleItems.sort((a, b) => (b.cost.totalKrw ?? 0) - (a.cost.totalKrw ?? 0));
+  if (facilityFilters.sort === 'cost-asc') visibleItems.sort((a, b) => (a.cost.totalKrw ?? 0) - (b.cost.totalKrw ?? 0));
+  $('#facility-csv')?.toggleAttribute('disabled', !state.placer.items.length);
+  if ($('#placed-results')) $('#placed-results').textContent = `${visibleItems.length} / ${state.placer.items.length}동 표시 · 행을 누르면 지도로 이동`;
+  if (!state.placer.items.length) {
+    el.innerHTML = '<p class="muted">아직 없음 — 카탈로그에서 끌어다 놓으세요.</p>';
+  } else {
+    // Scaffolda sfBarRow: 행 배경 = 비용 히스토그램 바 (최고가 대비 %)
+    const maxCost = Math.max(...state.placer.items.map((i) => i.cost.totalKrw), 1);
+    const diffDot = { low: 'var(--ok)', moderate: 'var(--warn)', high: 'var(--warn)', severe: 'var(--bad)' };
+    el.innerHTML = visibleItems.map((i) => `
+      <div class="placed-item ${state.placer.selectedUid === i.uid ? 'selected' : ''}" data-uid="${i.uid}"
+        style="--bar:${Math.round((i.cost.totalKrw / maxCost) * 100)}%">
+        <span class="c-chip" style="background:${i.spec.color};width:10px;height:10px"></span>
+        <span class="p-name">${i.spec.name}${i.protection === 'hardened' ? ' <span style="color:var(--warn)" title="방호 ×4.2">⛨</span>' : ''}
+          <span class="p-sub">${i.capacity}인·${i.floors}F</span></span>
+        <span class="p-diff" style="background:${diffDot[i.cost.difficulty]}" title="난이도 ${DIFFICULTY_LABELS[i.cost.difficulty]}"></span>
+        <span class="p-cost">${fmtKrw(i.cost.totalKrw)}</span>
+        <button class="p-del" data-del="${i.uid}" title="철거" aria-label="${i.spec.name} 철거">✕</button>
+      </div>`).join('') || '<p class="facility-empty">검색한 시설이 없습니다. 검색어를 지우면 전체 시설이 보입니다.</p>';
+    el.querySelectorAll('.placed-item').forEach((row) => {
+      row.onclick = (e) => {
+        if (e.target.dataset.del) return;
+        state.placer.select(row.dataset.uid);
+        const it = state.placer.items.find((x) => x.uid === row.dataset.uid);
+        if (it) flyTo(state.viewer, it.lon, it.lat - 0.0035, it.groundH + 260, 0, -32, 1.2);
+      };
+    });
+    el.querySelectorAll('[data-del]').forEach((b) => { b.onclick = () => state.placer.remove(b.dataset.del); });
+  }
+  $('#rotate-sel')?.toggleAttribute('disabled', !state.placer.selectedUid);
+  renderInspector();
+
+  const bd = $('#cost-breakdown');
+  if (bd) {
+    const sel = state.placer.items.find((i) => i.uid === state.placer.selectedUid);
+    bd.innerHTML = sel ? `<div class="card">
+        <h4>${sel.spec.name} <span class="muted">(${sel.dims.widthM}×${sel.dims.depthM}m · ${sel.floors}층${sel.protection === 'hardened' ? ' · 방호 ×4.2' : ''})</span></h4>
+        <div class="kv"><span>절토 ${sel.cost.cutM3.toFixed(0)}㎥ + 성토 ${sel.cost.fillM3.toFixed(0)}㎥</span><b>${fmtKrw(sel.cost.earthworkKrw)}</b></div>
+        <div class="kv"><span>옹벽 ${sel.cost.retainingWallAreaM2.toFixed(0)}㎡</span><b>${fmtKrw(sel.cost.wallKrw)}</b></div>
+        <div class="kv"><span>기초</span><b>${fmtKrw(sel.cost.foundationKrw)}</b></div>
+        <div class="kv"><span>건물 시공</span><b>${fmtKrw(sel.cost.buildingKrw)}</b></div>
+        <div class="kv"><span>부대비 10%</span><b>${fmtKrw(sel.cost.overheadKrw)}</b></div>
+        <div class="kv"><span><b>소계</b></span><b style="color:var(--accent)">${fmtKrw(sel.cost.totalKrw)}</b></div>
+        <div class="kv"><span>시공 난이도 (1인당 부지비용)</span>
+          <span class="badge ${sel.cost.difficulty === 'severe' ? 'fail' : sel.cost.difficulty === 'low' ? 'pass' : 'cond'}">${DIFFICULTY_LABELS[sel.cost.difficulty]}</span></div>
+        ${sel.cost.recommendReselection ? '<p class="muted" style="color:var(--bad)">⚠ 부지 재선정 권고 — 평탄지로 옮기면 토공비가 크게 줄어듭니다.</p>' : ''}
+      </div><p class="muted">산정 패드고 ${sel.cost.pad.toFixed(1)}m — Scaffolda 절토·성토 균형 방식${
+  // 지도에 세우는 높이는 이것과 다르다. 균형고에 얹으면 경사지에서 지형이 판을 대각선으로
+  // 잘라 절반이 언덕에 묻힌다 (Cesium 은 계산한 절토만큼 지형을 깎아 주지 않는다). 그래서
+  // 표시는 풋프린트 최고 지반에 놓고 그 아래를 기초로 메운다. 두 값이 다르면 밝혀 둔다.
+  Number.isFinite(sel.groundH) && Math.abs(sel.groundH - sel.cost.pad) >= 0.5
+    ? `<br>표시 정지고 ${sel.groundH.toFixed(1)}m · 기초 하단 ${(sel.foundBottom ?? sel.groundH).toFixed(1)}m`
+      + ' — 지형이 판을 가리지 않도록 최고 지반에 얹고 아래를 기초로 채운 값 (비용 산정과 무관)'
+    : ''}</p>`
+      : '<p class="muted">시설을 선택하면 항목별 내역이 표시됩니다.</p>';
+  }
+
+  // 총사업비 롤업 (Scaffolda projectCost: 공사 + 설계 76,000₩/㎡ + 인허가 티어)
+  const pcEl = $('#project-cost');
+  const pc = computeProjectCost(state.placer.items, towerCostEok(state.ents.towerHeight) * EOK);
+  if (pcEl) {
+    pcEl.innerHTML = `<div class="card">
+      <div class="kv"><span>공사비 (타워 ${towerCostEok(state.ents.towerHeight).toFixed(1)}억 + ${state.placer.items.length}동)</span><b>${fmtKrw(pc.constructionKrw)}</b></div>
+      <div class="kv"><span>설계비 (연면적 ${pc.floorAreaM2.toFixed(0)}㎡ × 7.6만)</span><b>${fmtKrw(pc.designFeeKrw)}</b></div>
+      <div class="kv"><span>인허가 수수료 (연면적 티어)</span><b>${fmtKrw(pc.permitFeeKrw)}</b></div>
+      <div class="kv"><span><b>총사업비</b></span><b style="color:var(--accent)">${fmtKrw(pc.totalKrw)}</b></div>
+    </div>`;
+  }
+  const tv = $('#cost-total-val');
+  if (tv) tv.textContent = fmtKrw(pc.totalKrw);
+  renderTwinCost();
+  renderPlanStats();
+  updateHud();
+}
+
+/** 시설 상세 인스펙터 — Scaffolda PlacementInspector 방식 (설정→즉시 재산출) */
+function renderInspector() {
+  const el = $('#inspector');
+  if (!el) return;
+  const sel = state.placer.items.find((i) => i.uid === state.placer.selectedUid);
+  if (!sel) {
+    el.innerHTML = '<p class="muted">건물을 선택하면 인원·층수·방호·방향을 조정할 수 있습니다.</p>';
+    return;
+  }
+  el.innerHTML = `
+    <div class="card">
+      <div class="slider-row"><label>수용 인원</label>
+        <input type="range" id="insp-cap" min="4" max="60" step="2" value="${sel.capacity}">
+        <span class="val" id="insp-cap-val">${sel.capacity}인</span></div>
+      <p class="muted" style="margin:-2px 0 6px">4평/인 원단위 → 풋프린트 ${sel.dims.widthM}×${sel.dims.depthM}m 자동 재계산</p>
+      <div class="kv" style="border:none"><span>층수 (기초단가 +22.5만/㎡·층)</span>
+        <span><button class="btn" id="insp-fl-dn" style="min-height:24px;padding:2px 10px">−</button>
+        <b style="margin:0 8px">${sel.floors}층</b>
+        <button class="btn" id="insp-fl-up" style="min-height:24px;padding:2px 10px">＋</button></span></div>
+      <div class="toggle-row"><span>방호시설 기준 적용 (건물비 ×4.2)</span>
+        <input type="checkbox" id="insp-prot" ${sel.protection === 'hardened' ? 'checked' : ''}></div>
+      <div class="slider-row"><label>배치 방위</label>
+        <input type="range" id="insp-hdg" min="0" max="345" step="15" value="${sel.headingDeg}">
+        <span class="val" id="insp-hdg-val">${sel.headingDeg}°</span></div>
+      <div class="btn-row">
+        <button class="btn" id="insp-dup">복제 (+8m 동측)</button>
+        <button class="btn" id="insp-walk">${svgIcon('walk')} 이 건물로 걸어가기</button>
+      </div>
+      <div class="kv" style="margin-top:6px"><span>1인당 부지비용</span>
+        <b>${fmtKrw(sel.cost.siteCostPerPersonKrw)}/인</b></div>
+    </div>`;
+
+  $('#insp-cap').oninput = (e) => { $('#insp-cap-val').textContent = `${e.target.value}인`; };
+  $('#insp-cap').onchange = async (e) => {
+    setLoading(true, '면적·비용 재산출…');
+    await state.placer.reprice(sel.uid, { capacity: +e.target.value });
+    setLoading(false);
+  };
+  $('#insp-fl-up').onclick = async () => {
+    if (sel.floors >= 5) return;
+    setLoading(true, '층수 변경 재산출…');
+    await state.placer.reprice(sel.uid, { floors: sel.floors + 1 });
+    setLoading(false);
+  };
+  $('#insp-fl-dn').onclick = async () => {
+    if (sel.floors <= 1) return;
+    setLoading(true, '층수 변경 재산출…');
+    await state.placer.reprice(sel.uid, { floors: sel.floors - 1 });
+    setLoading(false);
+  };
+  $('#insp-prot').onchange = async (e) => {
+    setLoading(true, '방호 기준 재산출…');
+    await state.placer.reprice(sel.uid, { protection: e.target.checked ? 'hardened' : 'none' });
+    setLoading(false);
+    toast(e.target.checked ? '방호시설 기준 적용 — 건물비 ×4.2' : '일반 기준 — 건물비 ×1.0');
+  };
+  $('#insp-hdg').oninput = (e) => {
+    sel.headingDeg = +e.target.value;
+    $('#insp-hdg-val').textContent = `${sel.headingDeg}°`;
+    state.placer._draw(sel);
+  };
+  $('#insp-dup').onclick = async () => {
+    setLoading(true, '복제 배치…');
+    // duplicate() 도 place() 와 같은 계약이다 — 겹치면 {blocked} 가 온다.
+    // 아무 말도 안 하면 「버튼이 고장났다」로 읽힌다.
+    const dup = await state.placer.duplicate(sel.uid).catch((e) => ({ blocked: e?.message ?? '복제 실패' }));
+    setLoading(false);
+    if (dup?.blocked) toast(`⛔ ${dup.blocked} — 자리를 비우고 다시 시도하세요`, 4200);
+    else if (dup) toast(`${sel.spec.name} 복제 — ${fmtKrw(dup.cost.totalKrw)}`);
+  };
+  $('#insp-walk').onclick = () => {
+    const spawn = offset(sel.lon, sel.lat, 180, sel.dims.depthM / 2 + 10);
+    state.fpv.exitSilent();
+    if (state.drone.active) state.drone.exit();
+    if (state.walk.active) state.walk.exitSilent();
+    state.walk.enter(spawn.lon, spawn.lat);
+    toast(`${sel.spec.name} 앞으로 이동 — E로 내부 진입`, 3600);
+  };
+}
+
+/**
+ * 클릭 배치 모드 — 켜 두면 지도 클릭이 전부 자산 배치가 된다. 연속 배치는 편하지만
+ * **켜져 있다는 걸 잊으면** 지도를 한 번 눌렀다가 원치 않는 자산이 선다. 그래서
+ * 모드가 켜진 동안에는 지도 위에 배너가 상주한다 — 끄는 법까지 적어서.
+ */
+function setPostPickType(typeId) {
+  state.postPickType = typeId ?? null;
+  let el = $('#post-pick-banner');
+  if (!state.postPickType) {
+    el?.remove();
+    $('#watch-pick')?.classList.remove('active');
+    $$('#watch-palette .wp-card').forEach((x) => x.classList.remove('on'));
+    state.viewer.canvas.style.cursor = '';
+    return;
+  }
+  const t = POST_TYPE[state.postPickType];
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'post-pick-banner';
+    $('#map-wrap').appendChild(el);
+  }
+  el.innerHTML = `<span class="ppb-dot" style="background:${t.color}"></span>
+    <b>클릭 배치 — ${t.name}</b>
+    <span class="ppb-hint">지도를 눌러 세우기 · 계속 누르면 계속 선다</span>
+    <button class="ppb-off">ESC 해제 ✕</button>`;
+  el.querySelector('.ppb-off').onclick = () => setPostPickType(null);
+  $('#watch-pick')?.classList.add('active');
+  $$('#watch-palette .wp-card').forEach((x) =>
+    x.classList.toggle('on', x.dataset.ptype === state.postPickType));
+  state.viewer.canvas.style.cursor = 'crosshair';
+}
+
+// ─── 감시자산 배치 영속화 ───
+// 세션(= state.store.planId)마다 분리한다 — 「이 세션엔 탑·감시자산만」이 되려면
+// 배치(SitePlanStore)뿐 아니라 감시자산도 세션 경계를 따라야 한다.
+const POSTS_KEY = 'gp_sensor_posts_v1';
+const postsStorageKey = () => `${POSTS_KEY}:${state.store.planId}`;
+
+function savePosts() {
+  try { localStorage.setItem(postsStorageKey(), JSON.stringify(state.posts.serialize())); } catch { /* noop */ }
+  sessionRegistry.touch(state.store.planId);
+}
+
+/** 멀티세션 이전 단일 저장 키를 쓰던 사용자를 「기본 세션」으로 승격할 때만 1회 복사. */
+function migrateLegacyPostsStorage() {
+  try {
+    const legacyId = localStorage.getItem('gp-digital-twin:planId');
+    if (!legacyId || legacyId !== state.store.planId) return;
+    if (localStorage.getItem(postsStorageKey())) return;
+    const legacy = localStorage.getItem(POSTS_KEY);
+    if (legacy) localStorage.setItem(postsStorageKey(), legacy);
+  } catch { /* noop */ }
+}
+
+// ─── 고정 침투 축선(축선 1~4) 표시 여부 — 세션마다 분리 ───
+// 4개 고정 축선은 GP-107 근방 좌표로 박혀 있는 합성 데이터라(data.ts INFIL_ROUTES),
+// 부팅마다 무조건 켜 두면(예전 동작) 건물·화력 시험용 세션 등 침투와 무관한 세션의
+// 지도까지 병력 표식으로 어수선해진다 — 기본값을 꺼둔 상태로 바꾸고 세션별로 기억한다.
+const infilVisibleKey = () => `gp-digital-twin:infilVisible:${state.store.planId}`;
+
+function setInfilVisiblePref(visible) {
+  try { localStorage.setItem(infilVisibleKey(), visible ? '1' : '0'); } catch { /* noop */ }
+}
+
+/** 부팅 직후 1회 — 이 세션이 마지막으로 정한 표시 여부를 적용한다(기본은 꺼짐). */
+function restoreInfilVisibility() {
+  let visible = false;
+  try { visible = localStorage.getItem(infilVisibleKey()) === '1'; } catch { /* noop */ }
+  state.infil.show(visible);
+}
+
+async function restorePosts() {
+  let rows = null;
+  try { rows = JSON.parse(localStorage.getItem(postsStorageKey()) ?? 'null'); } catch { /* noop */ }
+  if (Array.isArray(rows) && rows.length) {
+    await state.posts.restore(rows);
+    toast(`감시자산 ${rows.length}개소 복원`, 3200);
+  } else {
+    await state.posts.seedDefaults();
+  }
+  state.watchTab?.refresh();
+  renderVantageList();
+}
+
+/** 지도 위 한 점에 감시자산을 세운다 — 드롭·클릭 배치의 공통 경로. */
+async function placeSensorPost(typeId, lon, lat) {
+  const t = POST_TYPE[typeId];
+  if (!t) return null;
+  setLoading(true, `${t.name} 거치점 지형 샘플…`);
+  let post = null;
+  try {
+    post = await state.posts.add(typeId, lon, lat);
+  } finally { setLoading(false); }
+  if (!post) return null;
+  const perf = state.posts.perfOf(post);
+  state.watchTab?.invalidate();
+  state.watchTab?.refresh();
+  state.sensorFeed?.refreshChips();
+  const az = Math.round(azimuthDeg(SITE.gp.lon, SITE.gp.lat, lon, lat));
+  const d = Math.round(distM(SITE.gp.lon, SITE.gp.lat, lon, lat));
+  // 발전기는 실효거리로 말할 수 없다 — 배치 결과를 전원 수지로 알린다
+  if (!perf) {
+    const bal = recomputePower();
+    toast(`${post.name} 배치 — GP ${az}°/${d}m · 발전 ${t.genW}W 추가 · `
+      + `총 공급 ${bal.supplyW}W · ${bal.note}`, 5600);
+  } else {
+    toast(`${post.name} 배치 — GP ${az}°/${d}m · 지반 ${Math.round(post.groundH)}m · `
+      + `실효 ${fmtRange(perf.range)} / 청천 ${fmtRange(perf.specRange)} (${perf.limiter})`, 5200);
+  }
+  return post;
+}
+
+function wireMapInteractions() {
+  const canvas = state.viewer.canvas;
+  const pickLL = (x, y) => {
+    // GP 정밀지형(globe.show=false) 표출 중엔 globe.pick 이 보이지도 않는 라이브
+    // 지형과 광선을 맞춰 완전히 다른 지점을 반환한다(경사면일수록 어긋남이 커짐) —
+    // 화면에 실제로 그려진 표면(GLB 포함)을 그대로 잡는 pickPosition 을 우선한다.
+    const rt = state.realTerrain;
+    const screenPos = new Cesium.Cartesian2(x, y);
+    if (rt?.active && state.viewer.scene.pickPositionSupported) {
+      const picked = state.viewer.scene.pickPosition(screenPos);
+      if (picked) {
+        const c = Cesium.Cartographic.fromCartesian(picked);
+        return { lon: Cesium.Math.toDegrees(c.longitude), lat: Cesium.Math.toDegrees(c.latitude) };
+      }
+      return null;
+    }
+    const ray = state.viewer.camera.getPickRay(screenPos);
+    const pos = ray && state.viewer.scene.globe.pick(ray, state.viewer.scene);
+    if (!pos) return null;
+    const c = Cesium.Cartographic.fromCartesian(pos);
+    return { lon: Cesium.Math.toDegrees(c.longitude), lat: Cesium.Math.toDegrees(c.latitude) };
+  };
+
+  canvas.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    // 감시자산 팔레트 드래그 — 놓기 전에 그 자리의 실효 부채꼴을 미리 보여 준다
+    if (state.dragPostType) {
+      const rect0 = canvas.getBoundingClientRect();
+      const q = pickLL(e.clientX - rect0.left, e.clientY - rect0.top);
+      if (q) {
+        state.posts.ctx.groundHint = state.ents.groundH;
+        state.posts.showDropGhost(state.dragPostType, q.lon, q.lat);
+      }
+      return;
+    }
+    // 라이브 유효성 고스트 (초록=가능 / 빨강=차단+사유)
+    if (!state.dragSpecId) return;
+    const spec = FACILITY_CATALOG.find((f) => f.id === state.dragSpecId);
+    if (!spec) return;
+    const rect = canvas.getBoundingClientRect();
+    const ll = pickLL(e.clientX - rect.left, e.clientY - rect.top);
+    if (!ll) return;
+    state.placer.showBoundary(true);
+    state.placer.showGhost({ capacity: spec.capacity }, ll.lon, ll.lat, 0);
+  });
+  canvas.addEventListener('dragleave', () => { state.placer.hideGhost(); state.posts.hideDropGhost(); });
+  canvas.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    $('#drop-hint')?.classList.remove('active');
+    state.placer.hideGhost();
+    state.posts.hideDropGhost();
+    state.placer.showBoundary(false);
+    const raw = e.dataTransfer.getData('text/plain');
+    // 감시자산 드롭
+    if (raw.startsWith('post:') || state.dragPostType) {
+      const typeId = raw.startsWith('post:') ? raw.slice(5) : state.dragPostType;
+      state.dragPostType = null;
+      const rect0 = canvas.getBoundingClientRect();
+      const q = pickLL(e.clientX - rect0.left, e.clientY - rect0.top);
+      if (!q) return toast('지형 위에 놓아주세요');
+      await placeSensorPost(typeId, q.lon, q.lat);
+      return;
+    }
+    const specId = raw || state.dragSpecId;
+    if (!specId) return;
+    const rect = canvas.getBoundingClientRect();
+    const ll = pickLL(e.clientX - rect.left, e.clientY - rect.top);
+    if (!ll) return toast('지형 위에 놓아주세요');
+    setLoading(true, '지형 2m 격자 샘플링·비용 산출…');
+    const item = await state.placer.place(specId, ll.lon, ll.lat);
+    setLoading(false);
+    if (item?.blocked) toast(`⛔ ${item.blocked}`, 4200);
+    else if (item) toast(`${item.spec.name} 배치 — ${fmtKrw(item.cost.totalKrw)} (토공 ${fmtKrw(item.cost.earthworkKrw)} · ${DIFFICULTY_LABELS[item.cost.difficulty]})`, 4200);
+  });
+
+  const handler = new Cesium.ScreenSpaceEventHandler(canvas);
+  handler.setInputAction((ev) => {
+    if (state.fpv.active) return;
+    // 클릭 배치 모드가 켜져 있으면 그 자리에 세운다 (드래그보다 확실한 경로)
+    if (state.postPickType) {
+      const q = pickLL(ev.position.x, ev.position.y);
+      // 하늘이나 지형 밖을 눌렀을 때 아무 일도 안 일어나면 모드가 꺼진 줄 안다
+      if (q) placeSensorPost(state.postPickType, q.lon, q.lat);
+      else toast('지형 위를 클릭해 주세요 (하늘·화면 밖에는 세울 수 없습니다)', 3200);
+      return;
+    }
+    // 단일 pick 은 맨 위 한 장만 본다 — 다른 초소의 커버 부채꼴이 덮고 있으면
+    // 그 아래 손잡이(마스트·건물 상자)를 영영 집을 수 없다. 몇 겹을 뚫어 손잡이를 찾는다.
+    let hits = [];
+    try { hits = state.viewer.scene.drillPick(ev.position, 6); } catch { /* noop */ }
+    let handle = null;
+    for (const h of hits) {
+      const hid = h?.id?.id;
+      if (typeof hid !== 'string') continue;
+      const m = hid.match(POST_HANDLE_RE);
+      if (m && state.posts.get(m[1])) { handle = { kind: 'post', uid: m[1] }; break; }
+      if (/^b\d+-box$/.test(hid)) { handle = { kind: 'building', uid: hid.replace('-box', '') }; break; }
+    }
+    if (handle?.kind === 'post') {
+      state.posts.select(handle.uid);
+      state.postDrag = { uid: handle.uid, moved: false };
+      const c = state.viewer.scene.screenSpaceCameraController;
+      c.enableRotate = false; c.enableTranslate = false;
+      // 지도에서 초소를 찍으면 그 실효거리 줄이 사이드바 어디에 있든 바로 눈에 들어와야
+      // 「클릭 → 팝업」처럼 느껴진다 — 목록 스크롤 아래 묻혀 있으면 강조가 무의미하다.
+      document.querySelector(`.wl[data-uid="${handle.uid}"]`)
+        ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    if (handle?.kind === 'building') {
+      state.placer.select(handle.uid);
+      const orig = state.placer.items.find((i) => i.uid === handle.uid);
+      state.buildingDrag = { uid: handle.uid, moved: false, origLon: orig?.lon, origLat: orig?.lat };
+      state.placer.showBoundary(true);
+      const c = state.viewer.scene.screenSpaceCameraController;
+      c.enableRotate = false; c.enableTranslate = false;
+    }
+  }, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+
+  handler.setInputAction((ev) => {
+    if (state.postDrag) {
+      const q = pickLL(ev.endPosition.x, ev.endPosition.y);
+      if (!q) return;
+      const p = state.posts.get(state.postDrag.uid);
+      if (p) {
+        p.lon = q.lon; p.lat = q.lat;
+        state.posts._applyMatrix(p);
+        state.posts.redraw();
+        state.postDrag.moved = true;
+      }
+      return;
+    }
+    if (!state.buildingDrag) return;
+    const ll = pickLL(ev.endPosition.x, ev.endPosition.y);
+    if (!ll) return;
+    const it = state.placer.items.find((i) => i.uid === state.buildingDrag.uid);
+    if (it) {
+      it.lon = ll.lon; it.lat = ll.lat;
+      state.placer._draw(it);
+      state.placer.showGhost(it, ll.lon, ll.lat, it.headingDeg, it.uid);
+      state.buildingDrag.moved = true;
+    }
+  }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+
+  handler.setInputAction(async () => {
+    if (state.postDrag) {
+      const { uid, moved } = state.postDrag;
+      state.postDrag = null;
+      const c0 = state.viewer.scene.screenSpaceCameraController;
+      c0.enableRotate = true; c0.enableTranslate = true;
+      if (moved) {
+        const p = state.posts.get(uid);
+        // 능선 하나를 넘겼을 수 있다 — 지반고를 다시 재고 LOS 캐시를 버린다
+        if (p) await state.posts.move(uid, p.lon, p.lat);
+        state.watchTab?.invalidate();
+        state.watchTab?.refresh();
+        toast(`${p?.name ?? '초소'} 이동 — 지반 ${Math.round(p?.groundH ?? 0)}m · 가시성 재분석 필요`, 3800);
+      }
+      return;
+    }
+    if (!state.buildingDrag) return;
+    const { uid, moved, origLon, origLat } = state.buildingDrag;
+    state.buildingDrag = null;
+    state.placer.hideGhost();
+    state.placer.showBoundary(false);
+    const c = state.viewer.scene.screenSpaceCameraController;
+    c.enableRotate = true; c.enableTranslate = true;
+    if (moved) {
+      const it = state.placer.items.find((i) => i.uid === uid);
+      if (it) {
+        setLoading(true, '이동 위치 지형 재샘플…');
+        const res = await state.placer.move(uid, it.lon, it.lat);
+        setLoading(false);
+        if (res?.blocked) {
+          // Scaffolda handleUpdateZone: 검증 실패 시 원위치 복원
+          it.lon = origLon; it.lat = origLat;
+          state.placer._draw(it);
+          toast(`⛔ ${res.blocked} — 원위치로 되돌렸습니다.`, 4200);
+        } else {
+          toast(`${it.spec.name} 이동 — ${fmtKrw(it.cost.totalKrw)} (${DIFFICULTY_LABELS[it.cost.difficulty]})`);
+        }
+      }
+    }
+  }, Cesium.ScreenSpaceEventType.LEFT_UP);
+
+  // 드론 순찰 중심 지정 — 편대 관리 팝업의 「순찰 지점」이 여는 모드
+  handler.setInputAction((ev) => {
+    if (!state.pickPatrolUid) return;
+    const ll = pickLL(ev.position.x, ev.position.y);
+    if (!ll) { toast('지형 위의 지점을 클릭하세요'); return; }
+    const uid = state.pickPatrolUid;
+    state.pickPatrolUid = null;
+    state.fleet?.setPatrol(uid, ll.lon, ll.lat);
+    const d = state.fleet?.get(uid);
+    toast(`${d?.name ?? '드론'} 순찰 중심 — ${toMGRS(ll.lon, ll.lat)} · 반경 ${Math.round(d?.radiusM ?? 0)}m`, 4200);
+    state.manage?.refresh();
+  }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+  // 관측점 지도 지정 — 「어디 초소에서도」의 그 어디를 직접 찍는다
+  handler.setInputAction((ev) => {
+    if (!state.pickingVantage) return;
+    const ll = pickLL(ev.position.x, ev.position.y);
+    if (!ll) { toast('지형 위의 지점을 클릭하세요'); return; }
+    cancelVantagePick();
+    addCustomVantage(ll.lon, ll.lat);
+  }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+  // IPB 수동 배치 클릭
+  handler.setInputAction((ev) => {
+    if (state.pickingVantage) return;
+    if (!state.ipb?.placingKind || state.fpv.active) return;
+    const ll = pickLL(ev.position.x, ev.position.y);
+    if (!ll) return;
+    state.ipb.addManual(state.ipb.placingKind, ll.lon, ll.lat);
+    state.ipb.placingKind = null;
+    renderIpbTab();
+  }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+  // ═══ Scaffolda SiteEditorView 키맵 이식: Ctrl+Z/Y · Ctrl+C/V · Delete · Esc ═══
+  const isEditableTarget = (t) => /input|textarea|select/i.test(t?.tagName ?? '') || t?.isContentEditable;
+  window.addEventListener('keydown', async (e) => {
+    if (isEditableTarget(e.target)) return;
+    if (state.fpv.active || state.walk.active || state.drone.active) return; // 시점 모드 키와 충돌 방지
+    const ctrl = e.ctrlKey || e.metaKey;
+    const k = e.key.toLowerCase();
+
+    if (ctrl && (k === 'y' || (k === 'z' && e.shiftKey))) {
+      e.preventDefault();
+      toast(state.store.redo() ? '다시 실행' : '다시 실행할 작업이 없습니다');
+      return;
+    }
+    if (ctrl && k === 'z') {
+      e.preventDefault();
+      toast(state.store.undo() ? '실행 취소' : '되돌릴 작업이 없습니다');
+      return;
+    }
+    if (ctrl && k === 'c' && state.placer.selectedUid) {
+      e.preventDefault();
+      state.copiedUid = state.placer.selectedUid;
+      const it = state.placer.items.find((i) => i.uid === state.copiedUid);
+      toast(`복사: ${it?.spec.name ?? ''} — Ctrl+V로 붙여넣기`);
+      return;
+    }
+    if (ctrl && k === 'v' && state.copiedUid) {
+      e.preventDefault();
+      const src = state.placer.items.find((i) => i.uid === state.copiedUid);
+      if (!src) { toast('복사한 시설이 이미 철거되었습니다'); return; }
+      setLoading(true, '붙여넣기 배치…');
+      const dup = await state.placer.duplicate(src.uid);
+      setLoading(false);
+      toast(dup && !dup.blocked ? `붙여넣기: ${src.spec.name}` : `⛔ ${dup?.blocked ?? '붙여넣기 실패'}`);
+      return;
+    }
+    if (e.key === 'Delete' && state.placer.selectedUid) {
+      e.preventDefault();
+      state.placer.remove(state.placer.selectedUid);
+      toast('시설이 삭제되었습니다 — Ctrl+Z 로 되돌릴 수 있습니다');
+      return;
+    }
+    if (e.key === 'Escape') {
+      // 시네마틱 투어도 다른 시점 모드들과 같이 ESC 로 빠져나올 수 있어야 한다 —
+      // 「건너뛰기 ✕」 버튼과 정확히 같은 경로(토큰 취소·오버레이 숨김·시각복원)를 탄다.
+      if (_cine?.el?.classList.contains('on')) { _cine.onSkip?.(); return; }
+      if (state.postPickType) {
+        setPostPickType(null);
+        toast('클릭 배치 해제');
+      }
+      cancelVantagePick();
+      cancelPatrolPick();
+      state.placer.select(null);
+      state.ipb.placingKind = null;
+      state.coa?.cancel();
+      state.routeSketch?.cancel();
+      state.infil?.stopChase();
+    }
+  });
+}
+
+// ═════════════ ③ 침투 ═════════════
+// ═════════════ 워게임 판정 (탐지·교전 AAR) ═════════════
+async function runWargame() {
+  await ensureGrid();
+  const mode = state.infil.mode;
+  const feasible = allRouteData().filter((rd) => routeFeasible(rd, mode));
+  if (!feasible.length) { toast('현 수단으로 기동 가능한 축선이 없습니다'); return; }
+  setLoading(true, '전 축선 탐지확률 글림프스 누적 판정…');
+  await new Promise((r) => setTimeout(r, 30));   // 로딩 표시 반영
+  try {
+    state.wargameResults = judgeAll(feasible, mode, state.grid, state.assets.active, state.env?.state);
+  } finally {
+    setLoading(false);
+  }
+  state.wargameSel = 0;
+  paintJudgement(state.viewer, state.wargameDs, state.wargameResults[0]);
+  renderWargameOut();
+  openAarCard(state.wargameResults[0]);
+  const worst = state.wargameResults[0];
+  flyTo(state.viewer, SITE.gp.lon, SITE.gp.lat + 0.028, 4600, 180, -46);
+  toast(`판정 완료 — 최위험: ${worst.route.name.split(' — ')[0]} (${worst.verdict})`, 5200);
+}
+
+function renderWargameOut() {
+  const el = $('#wargame-out');
+  if (!el || !state.wargameResults) return;
+  el.innerHTML = state.wargameResults.map((r, i) => `
+    <div class="card clickable ${i === state.wargameSel ? 'selected' : ''}" data-wg="${i}" style="padding:7px 10px">
+      <div class="kv" style="border:none;padding:0">
+        <span><span style="color:${r.route.color}">●</span> ${r.route.name.split(' — ')[0]}</span>
+        <b style="color:var(--${r.verdictClass})">${r.t50 == null ? '미탐지' : `H+${Math.round(r.t50)}분 탐지`}</b></div>
+      <div class="kv" style="border:none;padding:2px 0 0">
+        <span>${r.verdict}</span>
+        <b>공백 ${Math.round(r.gapRatio * 100)}%</b></div>
+    </div>`).join('');
+  el.querySelectorAll('[data-wg]').forEach((c) => {
+    c.onclick = () => {
+      state.wargameSel = Number(c.dataset.wg);
+      const r = state.wargameResults[state.wargameSel];
+      paintJudgement(state.viewer, state.wargameDs, r);
+      renderWargameOut();
+      openAarCard(r);
+    };
+  });
+}
+
+/** AAR 사후검토 카드 — 누적 곡선 + 판정 요약 + 권고 */
+function openAarCard(r) {
+  const card = $('#aar-card');
+  card.classList.remove('hidden');
+  $('#aar-title').textContent = `AAR — ${r.route.name.split(' — ')[0]} · ${MOVE_MODES[r.mode].name.split(' ')[0]}`;
+  drawAarChart($('#aar-canvas'), r);
+  const contribTop = Object.entries(r.contrib).filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1]).slice(0, 3);
+  const total = contribTop.reduce((a, [, v]) => a + v, 0) || 1;
+  $('#aar-stats').innerHTML = `
+    <span>판정 <b style="color:var(--${r.verdictClass})">${r.verdict}</b></span>
+    <span>탐지 50% <b>${r.t50 == null ? '—' : `H+${Math.round(r.t50)}분`}</b></span>
+    <span>확정 90% <b>${r.t90 == null ? '—' : `H+${Math.round(r.t90)}분`}</b></span>
+    <span>최초 기여 <b>${r.firstAsset ?? '—'}</b></span>
+    <span>결심 여유 <b style="color:var(--${r.engagementMarginMin == null ? 'muted' : r.engagementMarginMin >= 0 ? 'ok' : 'bad'})">${
+  r.engagementMarginMin == null ? '—' : `${r.engagementMarginMin >= 0 ? '+' : ''}${Math.round(r.engagementMarginMin)}분`}</b></span>
+    <span>판정 공백 <b>${Math.round(r.gapRatio * 100)}%</b></span>
+    <span>환경 <b>${r.env.label}</b></span>
+    <span>기여 상위 <b>${contribTop.map(([k, v]) => `${k} ${Math.round((v / total) * 100)}%`).join(' · ') || '—'}</b></span>`;
+  $('#aar-reco').innerHTML = r.recommendations.length
+    ? r.recommendations.map((t) => `<div class="aar-reco-row">▸ ${t}</div>`).join('')
+    : '<div class="aar-reco-row ok">▸ 현 배치로 조기 탐지·교전 가능 — 권고 없음</div>';
+}
+
+/** 작도 축선 목록 — 삭제 시 routeCache에서도 제거되어 전 분석에서 빠진다 */
+function renderCustomRouteList() {
+  const el = $('#custom-route-list');
+  if (!el || !state.routeSketch) return;
+  const defs = state.routeSketch.defs;
+  el.innerHTML = defs.length ? defs.map((d) => `
+    <div class="placed-item">
+      <span class="coa-sw" style="background:${d.color}"></span>
+      <span class="p-name">${d.name.split(' — ')[0]}<span class="p-sub">${d.waypoints.length}개 웨이포인트 · 사용자 작도</span></span>
+      <button class="p-del" data-rsdel="${d.id}" title="축선 삭제" aria-label="${d.name.split(' — ')[0]} 축선 삭제">✕</button>
+    </div>`).join('')
+    : '<p class="muted" style="margin:2px 0">작도한 축선이 없습니다.</p>';
+  el.querySelectorAll('[data-rsdel]').forEach((b) => {
+    b.onclick = () => {
+      state.routeSketch.remove(b.dataset.rsdel);
+      state.wargameResults = null;
+      state.infil.rebuild();
+      renderInfilTab();
+      toast('작도 축선 삭제 — 전 분석에서 제외됨');
+    };
+  });
+}
+
+function renderInfilTab() {
+  const rds = allRouteData();
+  $('#page-infil').innerHTML = `
+    <div class="sec"><div class="sec-title">지도 표출</div>
+      <button class="mode-toggle" id="infil-visible-toggle"><b>고정 축선 표시</b>
+      <span>지도 위에 항상 떠 있는 4개 축선·병력 표식 — 이 세션에서만 켜고 끕니다</span></button>
+      <p class="muted" style="margin-top:4px">고정 축선(축선 1~4)은 GP-107 근방 좌표라, 다른 위치나
+      건물·화력 시험용 세션에서는 꺼 두는 편이 지도가 깔끔합니다. 세션마다 따로 기억됩니다.</p></div>
+    <div class="sec"><div class="sec-title">침투 수단</div>
+      <div id="mode-list"></div>
+      <p class="muted" style="margin-top:4px">축선별 경사 프로파일 P95로 기동 가능성 자동 판정 —
+      도보는 어디든, 차량은 완경사 축선만.</p></div>
+    <div class="sec"><div class="sec-title">리허설</div>
+      <button class="btn primary full" id="run-infil">침투 리허설 실행 ▶</button>
+      <div class="btn-row" id="chase-row"></div></div>
+    <div class="sec"><div class="sec-title">위협 축선 작도</div>
+      <button class="btn full" id="route-sketch-begin">✏ 새 침투 축선 작도 (클릭 → 우클릭 완성)</button>
+      <div id="custom-route-list" style="margin-top:6px"></div>
+      <p class="muted" style="margin-top:4px">계획관이 판단한 위협 축선을 직접 그립니다 —
+      지형 클램프·경사 분석 후 고정 축선과 동일하게 <b>리허설·작전분석·워게임 판정·보고서</b>에
+      반영됩니다. 침투 시작점(원거리)부터 GP 방향 순서로 클릭하세요.</p></div>
+    <div class="sec"><div class="sec-title">축선 상태</div><div id="route-status"></div></div>
+    <div class="sec"><div class="sec-title">탐지·교전 판정 (워게임 AAR)</div>
+      <button class="btn primary full" id="run-wargame">◈ 전 축선 탐지·교전 판정 실행 ▶</button>
+      <div id="wargame-out" style="margin-top:6px"></div>
+      <p class="muted" style="margin-top:4px">현재 침투 수단·가동 자산·환경(조도/가시거리/바람)으로
+      축선 전 구간의 <b>탐지확률을 글림프스 누적</b> 판정 — 탐지 50%/90% 시각, 판정 공백,
+      타격 결심 여유를 산출하고 축선을 판정색(초록=판정권·빨강=공백)으로 칠합니다.</p></div>
+    <div class="sec"><div class="sec-title">타워 관측 이벤트</div>
+      <div id="detect-log" style="max-height:180px;overflow-y:auto;margin:0 12px"><p class="muted">리허설 재생 시 기록됩니다.</p></div></div>`;
+
+  const infilToggle = $('#infil-visible-toggle');
+  infilToggle.classList.toggle('active', state.infil._visible);
+  infilToggle.onclick = () => {
+    const next = !state.infil._visible;
+    state.infil.show(next);
+    setInfilVisiblePref(next);
+    renderInfilTab();
+    toast(next ? '고정 축선 표시 켬' : '고정 축선 표시 끔 — 이 세션에서만 적용');
+  };
+
+  $('#mode-list').innerHTML = Object.values(MOVE_MODES).map((m) => `
+    <div class="card clickable ${state.infil.mode === m.id ? 'selected' : ''}" data-mode="${m.id}" style="padding:7px 10px">
+      <div class="kv" style="border:none;padding:0"><span>${m.icon} ${m.name}</span>
+      <b>${m.speed}m/s · 한계 ${m.maxSlopeDeg}°</b></div></div>`).join('');
+  $$('#mode-list [data-mode]').forEach((c) => {
+    c.onclick = () => {
+      state.infil.stopChase();
+      const hadJudgement = !!state.wargameResults;
+      // 판정은 침투 수단에 매인 결과다 — 수단을 바꾸면 앞의 판정은 더 이상 이 화면의 답이 아니다.
+      // 남겨 두면 「차량」을 골라 놓고 도보 판정을 읽게 된다.
+      state.wargameResults = null;
+      state.wargameDs?.entities.removeAll();
+      $('#aar-card').classList.add('hidden');
+      state.infil.setMode(c.dataset.mode);
+      renderInfilTab();
+      toast(`${MOVE_MODES[c.dataset.mode].name} — 기동가능 ${state.infil.units.length}개 축선`
+        + (hadJudgement ? ' · 탐지·교전 판정은 다시 실행해야 합니다' : ''), hadJudgement ? 4600 : 2800);
+    };
+  });
+
+  $('#run-infil').onclick = async () => {
+    await ensureGrid();
+    // 리허설을 요청했는데 표시가 꺼져 있으면 아무것도 안 보인다 — 요청 자체가 「보고 싶다」는 뜻이니 켠다.
+    if (!state.infil._visible) { state.infil.show(true); setInfilVisiblePref(true); renderInfilTab(); }
+    state.infil.rebuild();
+    state.infil.setTime(0);
+    $('#sim-time').value = 0;
+    $('#timeline-bar').classList.remove('hidden');
+    $('#detect-log').innerHTML = '';
+    flyTo(state.viewer, SITE.gp.lon, SITE.gp.lat + 0.033, 4000, 180, -44);
+    toast('리허설 준비 — ▶ 재생 (앰버=타워 관측권 / 적색점선=사각)');
+    renderInfilTab();
+  };
+
+  $('#run-wargame').onclick = runWargame;
+  if (state.wargameResults) renderWargameOut();
+
+  // ─── 위협 축선 작도 ───
+  $('#route-sketch-begin').onclick = () => {
+    if (state.routeSketch.begin()) {
+      flyTo(state.viewer, SITE.gp.lon, SITE.gp.lat + 0.02, 6500, 180, -62);
+    }
+  };
+  renderCustomRouteList();
+
+  const mode = state.infil.mode;
+  $('#route-status').innerHTML = rds.map((rd) => {
+    const ok = routeFeasible(rd, mode);
+    return `<div class="card" style="padding:7px 10px">
+      <div class="kv" style="border:none;padding:0">
+        <span><span style="color:${rd.route.color}">●</span> ${rd.route.name}</span>
+        <span class="badge ${ok ? 'pass' : 'fail'}">${ok ? '기동가능' : '기동불가'}</span></div>
+      <div class="kv" style="border:none;padding:2px 0 0"><span>경사 P95/최대 · 거리 · 소요</span>
+        <b>${rd.slopeP95.toFixed(1)}°/${rd.maxSlope.toFixed(0)}° · ${(rd.totalM / 1000).toFixed(1)}km · ${ok ? Math.round(rd.totalM / MOVE_MODES[mode].speed / 60) + '분' : '—'}</b></div>
+    </div>`;
+  }).join('');
+  $('#chase-row').innerHTML = state.infil.units.map((u) =>
+    `<button class="btn" data-chase="${u.rd.route.id}">${u.rd.route.name.split(' — ')[0]} 추적</button>`).join('')
+    + `<button class="btn" id="chase-stop">해제</button>`;
+  $$('#chase-row [data-chase]').forEach((b) => {
+    b.onclick = () => { state.infil.chase(b.dataset.chase); toast('추적 카메라 — 휠로 거리, 드래그로 각도'); };
+  });
+  const cs = $('#chase-stop');
+  if (cs) cs.onclick = () => { state.infil.stopChase(); flyTo(state.viewer, SITE.gp.lon, SITE.gp.lat + 0.033, 4000, 180, -44); };
+}
+
+function logDetect(route, distToGP, p) {
+  const el = $('#detect-log');
+  if (!el) return;
+  const div = document.createElement('div');
+  div.className = 'card';
+  div.style.cssText = 'padding:6px 9px;margin-bottom:4px;font-size:11px;border-left:2px solid var(--accent)';
+  div.innerHTML = `<b style="color:${route.color}">${route.name.split(' — ')[0]}</b> 타워 관측권 진입 ·
+    GP ${(distToGP / 1000).toFixed(2)}km · [${p.lon.toFixed(5)}, ${p.lat.toFixed(5)}] · 탑${state.gridHeight}m`;
+  el.prepend(div);
+  toast(`⚠ ${route.name.split(' — ')[0]} 관측 — ${(distToGP / 1000).toFixed(1)}km`, 3000);
+}
+
+// ═════════════ ④ 작전분석 ═════════════
+/** COA 스케치 목록 (IPB 탭) */
+function renderCoaList() {
+  const el = $('#coa-list');
+  if (!el) return;
+  const items = state.coa?.items ?? [];
+  el.innerHTML = items.length ? items.map((it) => `
+    <div class="placed-item">
+      <span class="coa-sw" style="background:${COA_TOOLS[it.tool].color}"></span>
+      <span class="p-name">${it.label}<span class="p-sub">${COA_TOOLS[it.tool].name} · ${it.points.length}점</span></span>
+      <button class="p-del" data-coadel="${it.uid}" title="도식 삭제" aria-label="${it.label} 도식 삭제">✕</button>
+    </div>`).join('')
+    : '<p class="muted" style="margin:2px 0">작도된 도식이 없습니다.</p>';
+  el.querySelectorAll('[data-coadel]').forEach((b) => {
+    b.onclick = () => state.coa.remove(b.dataset.coadel);
+  });
+}
+
+/** 작전계획 종합 보고서 — 라이브 상태 수집 → 인쇄용 A4 패키지 */
+function openOperationReport() {
+  const items = state.placer.items;
+  const pc = computeProjectCost(items, towerCostEok(state.ents.towerHeight) * EOK);
+  let blueprintDataUrl = null;
+  if (items.length) {
+    try {
+      const r = renderBlueprint({
+        placer: state.placer,
+        towerHeight: state.ents.towerHeight,
+        towerCostKrw: towerCostEok(state.ents.towerHeight) * EOK,
+        ipbItems: state.ipb.items,
+      });
+      blueprintDataUrl = r.canvas.toDataURL('image/png');
+    } catch (e) { console.warn('blueprint for report failed', e); }
+  }
+  const timeline = computeDecisionTimeline(state.ipb.routeScores, MOVE_MODES);
+  const html = buildOpReportHtml({
+    siteName: SITE.name ?? 'GP-107',
+    towerHeight: state.ents.towerHeight,
+    groundH: state.ents.groundH,
+    stats: pc,
+    items,
+    routeScores: state.ipb.routeScores,
+    ipbItems: state.ipb.items,
+    coaItems: (state.coa?.items ?? []).map((it) => ({
+      label: it.label, toolName: COA_TOOLS[it.tool].name, points: it.points.length,
+    })),
+    assets: [...(state.assets?.active ?? [])].map((id) => ASSET_CATALOG.find((x) => x.id === id)).filter(Boolean),
+    optimization: state.assets?.lastOptimization?.report ?? null,
+    blueprintDataUrl,
+    timeline,
+    trainingEvidence: state.training?.getReportContext?.() ?? null,
+  });
+  openOpReport(html);
+  toast('작전계획 보고서 생성 — 인쇄 또는 HTML 저장');
+}
+
+/** 작전 브리핑 스텝 — 현 계획 상태에서 생성 (참모 브리핑 순서) */
+function buildBriefingSteps() {
+  const gp = SITE.gp;
+  const gH = state.ents.groundH;
+  const items = state.placer.items;
+  const pc = computeProjectCost(items, towerCostEok(state.ents.towerHeight) * EOK);
+  const kv = (k, v) => `<div class="kv"><span>${k}</span><b>${v}</b></div>`;
+  const steps = [];
+
+  steps.push({
+    title: '① 임무 · 현황 개요',
+    html: `
+      ${kv('진지', `${SITE.name ?? 'GP-107'} — 능선 정상부 ${Math.round(gH)}m`)}
+      ${kv('감시탑', `${state.ents.towerHeight}m (관측고 ${Math.round(gH + state.ents.towerHeight + 2)}m)`)}
+      ${kv('배치 시설', `${items.length}동 · 연면적 ${Math.round(pc.floorAreaM2).toLocaleString()}㎡`)}
+      ${kv('총사업비', fmtKrw(pc.totalKrw))}
+      <p class="muted" style="margin-top:5px">합성 데모 — 실기준 아님. 브리핑은 현재 화면의 라이브 계획 데이터로 생성됩니다.</p>`,
+    fly: { lon: gp.lon, lat: gp.lat - 0.016, h: gH + 1700, heading: 0, pitch: -37 },
+  });
+
+  steps.push({
+    title: '② 지형 — 감제고지 분석',
+    html: `
+      ${kv('지형 특성', '험준 산지 · 능선 종심 배치')}
+      ${kv('감제 우위', '북측 접근로 대비 +217m')}
+      <p class="muted" style="margin-top:5px">정사 투영으로 능선 축과 접근 회랑을 확인합니다.
+      MGRS 격자(도구 툴바 ▦)를 켜면 좌표 통제가 쉬워집니다.</p>`,
+    fly: { lon: gp.lon, lat: gp.lat, h: gH + 3600, heading: 0, pitch: -89 },
+  });
+
+  const ranked = state.ipb.routeScores ?? [];
+  const rows = ranked.length
+    ? ranked.slice(0, 4).map((r, i) => kv(`${i === 0 ? '⚠ 최우선' : `${i + 1}순위`} ${r.rd.route.name.split(' — ')[0]}`,
+      `점수 ${r.score} · 커버 ${r.coverage.toFixed(0)}%`)).join('')
+    : allRouteData().map((rd) => kv(rd.route.name.split(' — ')[0],
+      routeFeasible(rd, 'vehicle') ? '차량 가능' : '도보 전용')).join('');
+  steps.push({
+    title: '③ 위협 — 침투 축선 평가',
+    html: `${rows}
+      <p class="muted" style="margin-top:5px">${ranked.length
+    ? 'KAIROS scoreRouteOption(0.34/0.26/0.18/0.22 가중)으로 채점된 축선 우선순위입니다.'
+    : '작전분석 탭에서 「기동로 분석」을 실행하면 축선별 점수가 브리핑에 반영됩니다.'}</p>`,
+    fly: { lon: gp.lon, lat: gp.lat + 0.03, h: gH + 3900, heading: 180, pitch: -44 },
+  });
+
+  if (state.ipb.items.length) {
+    steps.push({
+      title: '④ 작전분석 — NAI · DP · TAI',
+      html: state.ipb.items.map((it) => kv(`${it.kind} ${it.n}`, it.note)).join('')
+        + `<p class="muted" style="margin-top:5px">MIL-STD 통제도식 — 감시집중구역에서 조기 포착,
+        결심지점에서 타격 결심, 표적지역에서 화력 운용.</p>`,
+      fly: { lon: gp.lon, lat: gp.lat + 0.024, h: gH + 2900, heading: 180, pitch: -48 },
+    });
+  }
+
+  if (items.length) {
+    const top = [...items].sort((a, b) => (b.cost?.totalKrw ?? 0) - (a.cost?.totalKrw ?? 0)).slice(0, 5);
+    steps.push({
+      title: `${state.ipb.items.length ? '⑤' : '④'} 방책 — 시설 배치 계획`,
+      html: top.map((it) => kv(it.spec.name, `${it.capacity}인 · ${fmtKrw(it.cost?.totalKrw ?? 0)}`)).join('')
+        + (items.length > 5 ? `<p class="muted" style="margin-top:4px">외 ${items.length - 5}동 — 배치 탭에서 전체 확인</p>` : ''),
+      fly: { lon: gp.lon, lat: gp.lat - 0.006, h: gH + 430, heading: 0, pitch: -40 },
+    });
+  }
+
+  const activeAssets = [...(state.assets?.active ?? [])];
+  if (activeAssets.length) {
+    steps.push({
+      title: '감시 · 화력 자산 운용',
+      html: activeAssets.map((id) => {
+        const a = ASSET_CATALOG.find((x) => x.id === id);
+        return kv(a?.name ?? id, a?.range ? `유효 ${(a.range / 1000).toFixed(1)}km` : '가동');
+      }).join('')
+        + '<p class="muted" style="margin-top:5px">자산 사거리·DRI 링은 지도에 표시 중입니다.</p>',
+      fly: { lon: gp.lon, lat: gp.lat - 0.011, h: gH + 1150, heading: 0, pitch: -42 },
+    });
+  }
+
+  steps.push({
+    title: '결론 — 종합 판단',
+    html: `
+      ${kv('배치 완성도', items.length >= 8 ? '주요 시설 배치 완료' : `${items.length}동 — 표준 세트 10동 대비 보강 필요`)}
+      ${kv('위협 대비', ranked.length ? `최우선 축선 감시 커버 ${ranked[0].coverage.toFixed(0)}%` : '축선 분석 미실행')}
+      ${kv('전술 도식', `IPB ${state.ipb.items.length}개 · COA 스케치 ${state.coa?.items.length ?? 0}개`)}
+      <p class="muted" style="margin-top:5px">Space/▶로 다시 보거나 Esc로 종료합니다.
+      결심 탭에서 시나리오별 참모 판단을 이어가세요.</p>`,
+    fly: { lon: gp.lon, lat: gp.lat - 0.016, h: gH + 1700, heading: 0, pitch: -37 },
+  });
+
+  return steps;
+}
+
+function renderIpbTab() {
+  state.store?.commit();
+  const items = state.ipb.items;
+  $('#page-ipb').innerHTML = `
+    <div class="sec"><div class="sec-title">IPB — 기동로 · NAI · DP · TAI</div>
+      <p class="muted" style="margin-bottom:6px">KAIROS 방식 전장정보분석: DEM 경사 집계로 기동로를 분류하고
+      타워 가시영역과 교차시켜 <b>NAI(감시집중구역) · DP(결심지점) · TAI(표적지역)</b>를 도출.</p>
+      <button class="btn primary full" id="run-ipb">기동로 분석 + NAI/DP/TAI 자동 도출 ▶</button></div>
+    <div class="sec"><div class="sec-title">KAIROS 지형정보 분석</div>
+      <p class="muted" style="margin-bottom:6px">KAIROS 원본 엔진(terrainIntel.ts) 직접 구동 —
+      고도·경사 격자에서 <b>차폐/노출 히트맵 · 포병 관측점 · LOS 사선 · 도하 병목</b>을 도출.</p>
+      <div class="btn-row">
+        <button class="btn primary" id="run-intel">지형분석 실행 ▶</button>
+        <button class="btn" id="clear-intel">오버레이 해제</button>
+      </div>
+      <div id="intel-out" style="margin-top:6px"></div></div>
+    <div class="sec"><div class="sec-title">실도로 정보 (국가교통정보센터)</div>
+      <p class="muted" style="margin-bottom:6px">ITS 공개 API 실시간 소통정보로 기동로 점수(roadScore)를
+      실측값으로 바꿉니다. 조회 전에는 축선 경사 프로파일로 대체됩니다.</p>
+      <div class="btn-row">
+        <button class="btn primary" id="run-roads">실도로 조회 ▶</button>
+        <button class="btn" id="clear-roads">초기화</button>
+      </div>
+      <div id="roads-out" style="margin-top:6px"></div></div>
+    <div class="sec"><div class="sec-title">기동로 분류</div><div id="mob-list"></div></div>
+    <div class="sec"><div class="sec-title">수동 배치</div>
+      <div class="btn-row">
+        <button class="btn" data-place="NAI">+ NAI</button>
+        <button class="btn" data-place="DP">+ DP</button>
+        <button class="btn" data-place="TAI">+ TAI</button>
+      </div>
+      <p class="muted" style="margin-top:4px">버튼을 누른 뒤 지도를 클릭해 배치.</p></div>
+    <div class="sec"><div class="sec-title">전술 도식 ${items.length}</div>
+      <div id="ipb-list">${items.length ? '' : '<p class="muted">분석을 실행하거나 수동 배치하세요.</p>'}</div>
+      <button class="btn full" id="ipb-clear" ${items.length ? '' : 'disabled'}>전체 삭제</button></div>
+    <div class="sec"><div class="sec-title">전술 스케치 (COA 도식)</div>
+      <div class="coa-tools" id="coa-tools"></div>
+      <div id="coa-list" style="margin-top:6px"></div>
+      <p class="muted" style="margin-top:4px">방책 도식을 지도에 직접 작도 — 꼭짓점 클릭 후
+      우클릭으로 완성 (목표는 클릭 1회). 자동저장되어 새로고침 후 유지됩니다.</p></div>`;
+
+  $('#run-ipb').onclick = async () => {
+    await ensureGrid();
+    const n = state.ipb.autoSuggest(state.grid, state.infil.mode);
+    drawViewshedOverlay();
+    renderIpbTab();
+    flyTo(state.viewer, SITE.gp.lon, SITE.gp.lat + 0.028, 5200, 180, -50);
+    toast(`자동 도출 — 전술도식 ${n}개 (탑${state.gridHeight}m 가시영역 기준)`);
+  };
+  // ─── ITS 실시간 도로 정보 ───
+  $('#run-roads').onclick = async () => {
+    setLoading(true, '국가교통정보센터 실시간 소통정보 조회…');
+    try {
+      const info = await loadRoadInfo(SITE.gp, 0.25);
+      // 기동로 점수가 실측값으로 바뀌었으니 탭을 먼저 다시 그린다 —
+      // 순서를 뒤집으면 방금 써 넣은 조회 결과를 재렌더가 그대로 지운다(그랬었다).
+      renderIpbTab();
+      $('#roads-out').innerHTML = `
+        <div class="kv"><span>수집 링크</span><b>${info.totalLinks.toLocaleString()}개 · 도로 ${info.roads.length}종</b></div>
+        <div class="kv"><span>지역 기동로 점수</span><b>${info.roadScore}/100</b></div>
+        <div class="kv"><span>돌발상황</span><b>${info.eventCount}건</b></div>
+        <div class="tbl-scroll" style="margin-top:5px"><table class="dtbl"><thead><tr>
+          <th>도로명</th><th>링크</th><th>평균속도</th><th>최저</th><th>점수</th></tr></thead><tbody>${
+          info.roads.slice(0, 12).map((r) => `<tr><td>${r.roadName}</td><td>${r.links}</td>
+            <td>${r.avgSpeed}km/h</td><td>${r.minSpeed ?? '-'}</td><td>${r.roadScore}</td></tr>`).join('')
+        }</tbody></table></div>
+        <p class="muted" style="margin-top:4px">이후 축선 채점은 이 실측 roadScore 를
+        KAIROS <code>scoreRouteOption</code> 의 기동로 항에 넣습니다.</p>`;
+      toast(`ITS 실도로 ${info.totalLinks}개 링크 · 기동로 점수 ${info.roadScore}`);
+    } catch (error) {
+      $('#roads-out').innerHTML = `<p class="muted">조회 실패: ${error.message}</p>`;
+    } finally {
+      setLoading(false);
+    }
+  };
+  $('#clear-roads').onclick = () => { clearRoadInfo(); $('#roads-out').innerHTML = ''; renderIpbTab(); };
+
+  // ─── KAIROS 지형정보 분석 (원본 terrainIntel.ts 구동) ───
+  $('#run-intel').onclick = async () => {
+    setLoading(true, 'KAIROS 지형 격자 샘플 · LOS · 차폐 히트맵 산출…');
+    try {
+      const bounds = intelBoundsAround(SITE.gp, 3000);
+      // VWorld 데이터 API 상태 먼저 확인 (한도 vs 자료없음 구분)
+      const probe = await probeVworldData(bounds);
+      const layers = await loadIntelLayers(state.viewer, bounds, ['river', 'road', 'steep', 'forest']);
+      const a = await runIntelAnalysis(state.viewer, bounds, {
+        columns: 16, rows: 16,
+        runtimeSnapshot: state.infil?.runtime?.getLastSnapshot() ?? null,
+      });
+      state.intel = a;
+      const hit = layers.filter((l) => l.featureCount > 0);
+      const layerNote = hit.map((l) => `${l.layerDef?.label ?? l.key} ${l.featureCount}`).join(' · ');
+      $('#intel-out').innerHTML = `
+        <div class="kv"><span>지형 분류</span><b>${a.terrainClass}</b></div>
+        <div class="kv"><span>표고 / 기복</span><b>${Math.round(a.minElevation)}~${Math.round(a.maxElevation)}m · ${Math.round(a.reliefMeters)}m</b></div>
+        <div class="kv"><span>평균 경사 · 급경사(≥15°)</span><b>${a.meanSlopeDegrees.toFixed(1)}° · ${Math.round(a.steepSampleRatio * 100)}%</b></div>
+        <div class="kv"><span>평균 가시율 · 은폐도</span><b>${Math.round(a.meanVisibilityRatio * 100)}% · ${Math.round(a.meanConcealmentScore * 100)}%</b></div>
+        <div class="kv"><span>전술 마커 · 사격계획 · LOS</span><b>${a.markers.length} · ${a.firePlans.length} · ${a.losSegments.length}</b></div>
+        ${layerNote ? `<div class="kv"><span>VWorld 레이어</span><b>${layerNote}</b></div>` : ''}
+        ${!hit.length ? `<p class="muted" style="margin-top:4px">${
+          probe.reason === 'throttled'
+            ? '⚠ ' + probe.message
+            : probe.reason === 'no-key' ? '⚠ ' + probe.message
+              : probe.reason === 'no-coverage' ? 'VWorld 벡터 레이어: 이 지역에 해당 자료 없음 — 지형(DEM) 기반으로 분석했습니다.'
+                : 'VWorld 벡터 레이어 없음 — 지형(DEM) 기반으로만 분석했습니다.'
+        }</p>` : ''}`;
+      toast(`KAIROS 지형분석 — ${a.terrainClass} · 마커 ${a.markers.length}개`);
+    } catch (error) {
+      $('#intel-out').innerHTML = `<p class="muted">분석 실패: ${error.message}</p>`;
+    } finally {
+      setLoading(false);
+    }
+  };
+  $('#clear-intel').onclick = () => {
+    clearIntelAnalysis(state.viewer);
+    clearIntelLayers(state.viewer);
+    state.intel = null;
+    $('#intel-out').innerHTML = '';
+  };
+
+  $$('#page-ipb [data-place]').forEach((b) => {
+    b.onclick = () => { state.ipb.placingKind = b.dataset.place; toast(`지도를 클릭해 ${b.dataset.place} 배치`); };
+  });
+  $('#ipb-clear').onclick = () => { state.ipb.clear(); renderIpbTab(); };
+
+  // ─── COA 전술 스케치 도구 ───
+  $('#coa-tools').innerHTML = Object.entries(COA_TOOLS).map(([id, t]) => `
+    <button class="btn coa-tool" data-coa="${id}">
+      <span class="coa-sw" style="background:${t.color}"></span>${t.name}</button>`).join('');
+  $$('#coa-tools .coa-tool').forEach((b) => {
+    b.onclick = () => {
+      state.coa.setTool(b.dataset.coa);
+      $$('#coa-tools .coa-tool').forEach((x) => x.classList.toggle('on', x === b));
+    };
+  });
+  renderCoaList();
+
+  $('#mob-list').innerHTML = allRouteData().map((rd) => {
+    const cls = state.ipb.mobilityClass(rd);
+    return `<div class="card" style="padding:7px 10px">
+      <div class="kv" style="border:none;padding:0">
+        <span><span style="color:${rd.route.color}">●</span> ${rd.route.name.split(' — ')[1] ?? rd.route.name}</span>
+        <b>${cls.label}</b></div>
+      <div class="mob-bar" style="margin-top:5px">${cls.segsHtml}</div>
+      <div class="kv" style="border:none;padding:2px 0 0">
+        <span>도보 ${Math.round(rd.totalM / MOVE_MODES.walk.speed / 60)}분 · 차량 ${routeFeasible(rd, 'vehicle') ? Math.round(rd.totalM / MOVE_MODES.vehicle.speed / 60) + '분' : '불가'}</span>
+        <b>P95 ${rd.slopeP95.toFixed(1)}°</b></div>
+    </div>`;
+  }).join('');
+
+  if (items.length) {
+    $('#ipb-list').innerHTML = items.map((it) => `
+      <div class="placed-item" data-ipb="${it.uid}">
+        <span class="ipb-badge ${it.kind.toLowerCase()}">${it.kind}${it.n}</span>
+        <span class="p-name">${it.note}</span>
+        <button class="p-del" data-ipbdel="${it.uid}" title="삭제" aria-label="${it.kind}${it.n} 삭제">✕</button>
+      </div>`).join('');
+    $$('#ipb-list [data-ipb]').forEach((row) => {
+      row.onclick = (e) => {
+        if (e.target.dataset.ipbdel) return;
+        const it = items.find((x) => x.uid === row.dataset.ipb);
+        if (it) flyTo(state.viewer, it.lon, it.lat - 0.006, (it.h ?? state.ents.groundH) + 700, 0, -45, 1.4);
+      };
+    });
+    $$('#ipb-list [data-ipbdel]').forEach((b) => {
+      b.onclick = () => { state.ipb.remove(b.dataset.ipbdel); renderIpbTab(); };
+    });
+  }
+}
+
+// ───────────── 탭·타임라인 ─────────────
+function switchTab(name) {
+  $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
+  $$('.tab-page').forEach((p) => p.classList.toggle('active', p.id === `page-${name}`));
+  window.dispatchEvent(new CustomEvent('gp:tab-active', { detail: name }));
+  // 타격 시뮬레이션 HUD 는 화력 탭에서만 지도를 덮는다 (계획 자체는 계속 살아 있다)
+  strikeSetActive(name === 'fires');
+  // 침투 경로·유닛 오버레이(가시권 세그먼트 + VISTA 유닛 박스)도 침투 탭을 떠나면 지도에서 걷는다.
+  // 안 걷으면 다른 탭으로 넘어가도 유닛 라벨·박스가 지도 위에 그대로 남는다.
+  state.infil?.show(name === 'infil');
+  // 리허설 타임라인 바(#timeline-bar)는 지도 위 HTML 오버레이라 위 show()로는 안 걷힌다 —
+  // 닫는 버튼이 아예 없어서 한 번 열면 다른 탭으로 가도 영구히 떠 있던 것도 같은 원인.
+  // 워게임 AAR 판정 레이어(state.wargameDs)와 그 카드(#aar-card)도 같은 문제 — 닫기를
+  // 누르지 않고 탭을 옮기면 판정 라벨·도식이 지도에 계속 남는다.
+  if (name !== 'infil') {
+    $('#timeline-bar')?.classList.add('hidden');
+    $('#aar-card')?.classList.add('hidden');
+    if (state.wargameDs) state.wargameDs.show = false;
+    if (state.playing) { state.playing = false; const play = $('#sim-play'); if (play) play.textContent = '▶'; }
+    // 추적(chase) 카메라도 같은 병 — show(false)는 유닛 표시만 걷을 뿐, 카메라를 그
+    // 유닛에 붙들어 매 둔 preRender 훅은 끄지 않는다. 안 풀면 다른 탭으로 가도
+    // 카메라가 계속 그 유닛을 따라다니며 flyTo 등 다른 시점 이동을 전부 무시한다.
+    state.infil?.stopChase();
+  } else if (state.wargameDs) {
+    state.wargameDs.show = true;
+  }
+  if (name === 'watch') state.watchTab?.refresh();
+  if (name === 'guide') {
+    try { localStorage.setItem('gp_guide_seen', NEW_FEATURES[0]?.date ?? ''); } catch { /* noop */ }
+    $('.tab-guide')?.classList.remove('has-new');
+    renderGuideTab();
+  }
+}
+
+// ═════════════ 설명서 탭 — 참여형 튜토리얼 (tutorial.js) ═════════════
+const GUIDE_FLOW = [
+  { icon: svgIcon('build'), label: '설계', course: 'build' },
+  { icon: svgIcon('tower'), label: '검증', course: 'tower' },
+  { icon: svgIcon('infil'), label: '체감', course: 'infil' },
+  { icon: svgIcon('fires'), label: '화력', course: 'fires' },
+  { icon: svgIcon('decision'), label: '결심', course: 'decision' },
+];
+const GUIDE_NEW_FEATURE_COLLAPSE = 8;
+
+function renderGuideTab() {
+  const done = Tutorial.doneMap();
+  const doneCount = COURSES.filter((c) => done[c.id]).length;
+  const savedPos = Tutorial.savedPos();
+  const savedCourse = savedPos ? COURSES.find((c) => c.id === savedPos.course) : null;
+  const nextCourse = COURSES.find((c) => !done[c.id]);
+  const areas = [...new Set(NEW_FEATURES.map((f) => f.area ?? 'UX'))];
+  const latestDate = NEW_FEATURES[0]?.date;
+  $('#page-guide').innerHTML = `
+    <div class="sec"><div class="sec-title">참여형 사용설명서</div>
+      <p class="muted" style="margin-top:4px">읽는 설명서가 아니라 <b>직접 해보는</b> 설명서입니다.
+      코스를 시작하면 코치 카드가 다음 행동을 알려주고 화면의 해당 버튼을 스포트라이트로 비춥니다 —
+      실제로 완료하면 자동으로 진행되고, 말미엔 1문항 체크포인트 퀴즈가 있습니다.
+      진행도: <b style="color:var(--accent)">${doneCount}/${COURSES.length} 코스 완료${doneCount === COURSES.length ? ' 🏆 마스터!' : ''}</b></p>
+      <div class="guide-flow">이 앱의 한 바퀴:
+        ${GUIDE_FLOW.map((g, i) => `${i ? '<span class="gf-arrow">→</span>' : ''}<span class="gf-step${done[g.course] ? ' gf-done' : ''}">${g.icon} ${g.label}</span>`).join('')}
+      </div>
+      ${savedCourse ? `<button class="btn primary full" id="tut-resume">▶ 이어서 하기 — ${savedCourse.icon} ${savedCourse.title} (${savedPos.idx + 1}단계부터)</button>` : ''}</div>
+    <div class="sec"><div class="sec-title">코스</div>
+      ${COURSES.map((c, i) => `
+      <div class="card clickable guide-course" data-course="${c.id}" style="padding:9px 11px">
+        <div class="kv" style="border:none;padding:0">
+          <span><span class="muted" style="font-family:var(--display)">${i + 1}.</span>
+            ${c.icon} <b>${c.title}</b> <span class="muted">· ~${c.minutes}분</span>
+            ${!done[c.id] && c.id === nextCourse?.id ? '<span class="gc-next">다음 추천</span>' : ''}</span>
+          <span>${done[c.id] ? '<span class="gc-done">✓ 완료</span>' : '<span class="muted">시작 ▶</span>'}</span></div>
+        <div class="muted" style="font-size:11px;margin-top:2px">${c.goal}</div>
+      </div>`).join('')}
+      <p class="muted" style="margin-top:4px">추천 순서: 위에서 아래로. 언제든 「종료」로 빠져나올 수 있고,
+      막히면 「건너뛰기」로 넘어갑니다.</p></div>
+    <div class="sec"><div class="sec-title">새로 추가된 기능</div>
+      <div class="btn-row gf-filters" style="flex-wrap:wrap;margin:0 12px 8px">
+        <button class="btn active" data-gf-filter="all">전체 ${NEW_FEATURES.length}</button>
+        ${areas.map((a) => `<button class="btn" data-gf-filter="${a}">${a} ${NEW_FEATURES.filter((f) => (f.area ?? 'UX') === a).length}</button>`).join('')}
+      </div>
+      ${NEW_FEATURES.map((f, i) => `
+      <div class="card gf-card${i >= GUIDE_NEW_FEATURE_COLLAPSE ? ' gf-more hidden' : ''}" data-gf-area="${f.area ?? 'UX'}" style="padding:8px 11px">
+        <div class="kv" style="border:none;padding:0"><span>${f.date === latestDate ? '<span class="gf-new">NEW</span> ' : ''}<b>${f.title}</b></span>
+          <span class="muted" style="font-family:var(--display);font-size:10.5px">${f.date} · ${f.area ?? 'UX'}</span></div>
+        <div class="muted" style="font-size:11px;margin-top:2px">${f.desc}
+          ${f.course ? `<a href="#" data-feat-course="${f.course}" style="color:var(--accent)">→ 관련 코스 해보기</a>` : ''}</div>
+      </div>`).join('')}
+      ${NEW_FEATURES.length > GUIDE_NEW_FEATURE_COLLAPSE ? `<button class="btn full" id="gf-more-btn" style="margin:2px 12px 0;width:calc(100% - 24px)">+ ${NEW_FEATURES.length - GUIDE_NEW_FEATURE_COLLAPSE}개 더 보기</button>` : ''}</div>
+    <div class="sec"><div class="sec-title">조작 요약</div>
+      <p class="muted" style="margin:0 12px 6px">지도를 보다가도 <b>?</b> 키로 같은 표를 띄울 수 있습니다.</p>
+      ${SHORTCUT_GROUPS.map((g) => `
+        <div class="sec-sub" style="margin:6px 12px 2px">${g.title}</div>
+        <table class="guide-keys" style="width:calc(100% - 24px);margin:0 12px;border-collapse:collapse">
+          ${g.rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}
+        </table>`).join('')}</div>`;
+  $$('#page-guide [data-course]').forEach((el) => {
+    el.onclick = () => state.tutorial.start(el.dataset.course);
+  });
+  $$('#page-guide [data-feat-course]').forEach((a) => {
+    a.onclick = (e) => { e.preventDefault(); state.tutorial.start(a.dataset.featCourse); };
+  });
+  $('#tut-resume')?.addEventListener('click', () => state.tutorial.resume());
+
+  // 새로 추가된 기능 — 영역 필터 + 접기/펼치기 (기본 8개만 표시)
+  let gfShowAll = false;
+  const gfCards = $$('#page-guide .gf-card');
+  $('#gf-more-btn')?.addEventListener('click', () => {
+    gfShowAll = true;
+    gfCards.forEach((c) => c.classList.remove('hidden'));
+    $('#gf-more-btn').remove();
+  });
+  $$('#page-guide [data-gf-filter]').forEach((btn) => {
+    btn.onclick = () => {
+      $$('#page-guide [data-gf-filter]').forEach((b) => b.classList.toggle('active', b === btn));
+      const f = btn.dataset.gfFilter;
+      gfCards.forEach((c) => {
+        const match = f === 'all' || c.dataset.gfArea === f;
+        const collapsed = f === 'all' && !gfShowAll && c.classList.contains('gf-more');
+        c.classList.toggle('hidden', !match || collapsed);
+      });
+      $('#gf-more-btn')?.classList.toggle('hidden', f !== 'all' || gfShowAll);
+    };
+  });
+}
+function wireTabs() {
+  $$('.tab').forEach((t) => {
+    if (t.dataset.reactManaged === 'true') return;
+    t.onclick = () => switchTab(t.dataset.tab);
+  });
+  window.addEventListener('gp:tab-change', (event) => {
+    const name = event.detail;
+    if (typeof name === 'string') switchTab(name);
+  });
+}
+
+// ═════════════ 종합 평가보고서 (엔진 산출 → LLM 평가) ═════════════
+/**
+ * 배치최적화 · 적 이동경로 · 자산배치 · 화력결과를 순서대로 산출한 뒤
+ * 그 결과를 LLM 에 넘겨 평가보고서를 만든다. 수치는 전부 엔진이 계산한 것이고
+ * LLM 은 해석·연결·권고만 한다 (VISTA 지형 브리핑과 같은 구성).
+ */
+async function runEvaluation({ model } = {}) {
+  showEvalPanel();
+  const stage = (t) => setEvalStage(t);
+  // 모델 예열을 분석과 병행한다 — 콜드스타트를 분석 시간 뒤에 숨긴다.
+  const warming = warmModel(model);
+  try {
+    // ① 가시영역 (배치·경로 판정의 공통 입력)
+    stage('감시탑 가시영역 광선추적…');
+    await ensureGrid();
+
+    // ② 적 이동경로 채점 + NAI/DP/TAI (KAIROS scoreRouteOption)
+    stage('적 이동경로 채점 · NAI/DP/TAI 도출…');
+    if (!state.ipb.routeScores.length) {
+      state.ipb.autoSuggest(state.grid, state.infil.mode);
+      renderIpbTab();
+    }
+    const routeScores = state.ipb.routeScores;
+
+    // ③ 지형정보 분석 (KAIROS terrainIntel)
+    if (!state.intel) {
+      stage('KAIROS 지형정보 분석 (격자·LOS·차폐)…');
+      const b = intelBoundsAround(SITE.gp, 3000);
+      try {
+        await loadIntelLayers(state.viewer, b, ['river', 'road', 'steep', 'forest']);
+        state.intel = await runIntelAnalysis(state.viewer, b, { columns: 16, rows: 16 });
+      } catch { /* VWorld 한도 등은 흡수 — 지형분석 없이 진행 */ }
+    }
+
+    // ④ 자산배치 위협권 (VISTA threatCoverage)
+    stage('자산배치 위협권 · 드론 진출한계 산출…');
+    let threat = null;
+    if (state.threatLayer) {
+      if (!state.threatLayer.placed.length) {
+        state.threatLayer.applyDefaultLayout(
+          GP_SCALE_PROFILES.map((p) => p.className));
+      }
+      threat = { placed: state.threatLayer.placed, envelope: state.threatLayer.droneEnvelope() };
+    }
+
+    // ⑤ 화력결과 — 최우선 위협축선 종말부 표적 (KAIROS 교리)
+    stage('화력운용 판단 (탄약효과·부수피해·사격부대)…');
+    let fires = state.lastFireDecision ?? null;
+    const best = routeScores[0];
+    if (!fires && best) {
+      const p = best.rd.pts[Math.floor(best.rd.pts.length * 0.82)];
+      const friendly = [
+        distM(SITE.gp.lon, SITE.gp.lat, p.lon, p.lat),
+        ...state.placer.items.map((it) => distM(it.lon, it.lat, p.lon, p.lat)),
+      ];
+      fires = fireDecision({
+        distanceM: distM(SITE.gp.lon, SITE.gp.lat, p.lon, p.lat),
+        terrainClassLabel: state.intel?.terrainClass ?? null,
+        forestRatio: state.intel?.forestSampleRatio ?? 0,
+        nearestFriendlyM: Math.min(...friendly),
+      });
+      state.lastFireDecision = fires;
+    }
+
+    // ⑥ 구조화 페이로드 → LLM
+    stage('엔진 산출물 정리…');
+    const payload = buildEvalPayload({
+      placement: state.lastPlacement ?? null,
+      placerItems: state.placer.items,
+      routeScores,
+      ipbItems: state.ipb.items,
+      intel: state.intel ?? null,
+      fires,
+      threat,
+      infilMode: state.infil.mode,
+      towerHeight: state.ents.towerHeight,
+      coveragePct: state.coveragePct ?? null,
+      roadInfo: cachedRoadInfo(),
+      gapClosure: state.gapClosure ?? null,
+    });
+
+    stage(`${model} 모델 준비…`);
+    await warming;
+    stage(`${model} 평가 작성 중… (1~2분 소요)`);
+    const { report, model: used, promptChars } = await generateEvalReport(payload, { model });
+    state.lastEval = { report, payload, model: used };
+    renderEvalReport(report, { model: used, promptChars, payload });
+    toast(`평가보고서 완료 — 판정 ${report?.verdict?.grade ?? '-'}`);
+  } catch (error) {
+    const msg = error instanceof EvalReportError ? error.message : error.message;
+    renderEvalReport(null, { error: msg });
+    toast(`평가 실패: ${msg}`, 5000);
+  }
+}
+
+/**
+ * 감시공백 자동 보완 — 평가가 지적한 취약 축선을 실제로 덮는 부감시소를 계산한다.
+ * 지적 → 해답 → 개선폭 측정까지가 한 흐름이다.
+ */
+async function runGapClosure() {
+  const scores = state.ipb.routeScores;
+  if (!scores.length) { toast('먼저 종합 분석을 실행하세요'); return null; }
+
+  // 취약 축선 = 기동 가능하면서 감시 공백이 가장 큰 축선 (동점이면 총점 최저)
+  const worst = [...scores]
+    .sort((a, b) => (b.gap - a.gap) || (a.score - b.score))[0];
+
+  setLoading(true, `${worst.rd.route.name.split(' — ')[0]} 감시공백 보완 위치 탐색…`);
+  try {
+    const result = await findObservationPost(state.viewer, {
+      routeData: worst.rd,
+      currentGrid: state.grid,
+      postHeightM: 12,
+      threatPlaced: state.threatLayer?.placed ?? [],
+      onProgress: (p) => { $('#loading-text').textContent = `LOS 판정 ${(p * 100).toFixed(0)}%`; },
+    });
+    if (!result.ok) { toast(result.message ?? '보완 대상이 없습니다'); return null; }
+
+    state.gapClosure = result;
+    state.gapLayer.render(result);
+    state.gapLayer.show(true);
+    flyTo(state.viewer, result.post.lon, result.post.lat - 0.006,
+      state.ents.groundH + 900, 0, -42, 1.6);
+    toast(`부감시소 권고 — ${result.route.name.split(' — ')[0]} 커버 `
+      + `${result.coverage.beforePercent}% → ${result.coverage.afterPercent}%`);
+    return result;
+  } catch (error) {
+    toast(`보완 탐색 실패: ${error.message}`, 4500);
+    return null;
+  } finally {
+    setLoading(false);
+  }
+}
+
+// ═════════════ ⑤-2 예측 (보수소요 예측·투자조합 결과를 트윈에 연동) ═════════════
+function renderForecast() {
+  renderForecastTab($('#page-forecast'), {
+    viewer: state.viewer, Cesium: window.Cesium, toast, flyTo,
+    placerItems: () => state.placer?.items ?? [],
+  });
+}
+
+// ═════════════ ⑥ 결심 (KAIROS 결심엔진 14개 시나리오) ═════════════
+function renderDecision() {
+  renderDecisionTab($('#page-decision'), {
+    toast,
+    decisionContext: () => ({
+      intel: state.intel ?? null,
+      routeScores: state.ipb?.routeScores ?? [],
+      infilUnits: state.infil?.units ?? [],
+      infilMode: state.infil?.mode ?? 'walk',
+      placerItems: state.placer?.items ?? [],
+      roadInfo: cachedRoadInfo(),
+    }),
+  });
+}
+
+// ═════════════ ⑤ 화력 (KAIROS 교리 · 위협권 · 작전 보고서) ═════════════
+function renderFires() {
+  renderFiresTab($('#page-fires'), {
+    threatLayer: state.threatLayer,
+    toast,
+    // 정밀타격 효과 시뮬레이션은 이 지도 위에서 돈다 — 뷰어를 새로 만들지 않는다
+    viewer: state.viewer,
+    state,
+    site: { lon: SITE.gp.lon, lat: SITE.gp.lat },
+    runEvaluation,
+    runGapClosure,
+    listOllamaModels,
+    clearGapClosure: () => { state.gapLayer?.clear(); state.gapClosure = null; },
+    reportContext: () => ({
+      placerItems: state.placer.items,
+      routes: allRouteData(),
+      infilMode: state.infil.mode,
+      ipbItems: state.ipb.items,
+      intel: state.intel ?? null,
+      towerHeight: state.ents.towerHeight,
+      coveragePct: state.coveragePct ?? null,
+      fires: state.lastFireDecision ?? null,
+      trainingEvidence: state.training?.getReportContext?.() ?? null,
+      // 보고서에 KAIROS 결심 14건을 함께 싣는다 (현재 GP 상황 입력 기준)
+      decisions: (() => {
+        try {
+          const inputs = buildDecisionInputs({
+            intel: state.intel ?? null,
+            routeScores: state.ipb?.routeScores ?? [],
+            infilUnits: state.infil?.units ?? [],
+            infilMode: state.infil?.mode ?? 'walk',
+            placerItems: state.placer?.items ?? [],
+            roadInfo: cachedRoadInfo(),
+          });
+          return runAllDecisions(inputs);
+        } catch { return []; }
+      })(),
+    }),
+  });
+}
+
+function wireTimeline() {
+  const slider = $('#sim-time');
+  const play = $('#sim-play');
+  let rafId = null;
+  const step = () => {
+    if (!state.playing) return;
+    state.infil.setTime(Math.min(1, state.infil.tNorm + 0.0018));
+    slider.value = state.infil.tNorm * 100;
+    updateClock();
+    if (state.infil.tNorm >= 1) { state.playing = false; play.textContent = '▶'; return; }
+    rafId = requestAnimationFrame(step);
+  };
+  play.onclick = () => {
+    state.playing = !state.playing;
+    play.textContent = state.playing ? '⏸' : '▶';
+    if (state.playing) rafId = requestAnimationFrame(step);
+    else cancelAnimationFrame(rafId);
+  };
+  slider.oninput = () => { state.infil.setTime(slider.value / 100); updateClock(); };
+  function updateClock() {
+    const t = state.infil.tNorm * state.infil.maxDur;
+    const m = Math.floor(t / 60), s = Math.floor(t % 60);
+    $('#sim-clock').textContent = `T+${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+}
+
+/**
+ * 지형 소스가 바뀌면 「땅이 어디 있는가」가 통째로 바뀐다 — 그 위에 세워 둔 것들의
+ * 지반고를 한 번에 다시 잰다. 한 번의 일괄 샘플이라 왕복은 한 번뿐이다.
+ *
+ * GP 블렌더 정밀지형(realTerrain)이 표출 중이면 실제로 화면에 그려지는 표면은
+ * VWorld 지형이 아니라 그 GLB 하이트필드다. VWorld 표고만 재서 세워 두면 감시탑·
+ * 초소·허브·시설이 새 블렌더 표면 위에 그대로 공중부양(또는 침하)한다 — 이 함수가
+ * 실제 표시 표면(GLB 우선, 범위 밖·미로드 시 VWorld 폴백)을 기준으로 재는 유일한 곳이다.
+ */
+async function remeasureGroundHeights() {
+  const viewer = state.viewer;
+  const facilities = state.placer?.items ?? [];
+  const posts = state.posts?.list() ?? [];
+  const custom = state.customVantages ?? [];
+  const points = [
+    { lon: SITE.gp.lon, lat: SITE.gp.lat },
+    { lon: SITE.hub.lon, lat: SITE.hub.lat },
+    ...facilities.map((it) => ({ lon: it.lon, lat: it.lat })),
+    ...posts.map((p) => ({ lon: p.lon, lat: p.lat })),
+    ...custom.map((c) => ({ lon: c.lon, lat: c.lat })),
+  ];
+  const cartos = points.map((p) => Cesium.Cartographic.fromDegrees(p.lon, p.lat));
+  await sampleTerrainDetailed(viewer.terrainProvider, cartos);
+  const rt = state.realTerrain;
+  const groundAt = (i) => {
+    if (rt?.active && rt.surfaceReady) {
+      const h = rt.surfaceHeightAt(points[i].lon, points[i].lat);
+      if (Number.isFinite(h)) return h;                    // GLB 표면 범위 안 — 실제 표시 표면 우선
+    }
+    return cartos[i].height;                                // 범위 밖/미준비 — VWorld 폴백
+  };
+  let i = 0;
+  state.ents.groundH = groundAt(i++) ?? 0;
+  state.ents.hubGroundH = groundAt(i++) ?? 0;
+  // 시설은 groundH 한 값만 center-point로 patch하면 안 된다 — foundBottom(기단 하단)이
+  // 옛 지형 기준으로 남아 stemDepth(=groundH−foundBottom)가 어긋나고, 블렌더 표면으로
+  // 갈아탄 groundH만 붕 뜬 채 기단이 그 간극만큼 늘어나 건물 전체가 공중부양한다.
+  // regroundAll()이 발자국 9점 샘플로 groundH·foundBottom·slopeDeg 를 함께 재계산한다
+  // (GP 미준비 시엔 내부적으로 no-op 이므로 그 경우엔 기존 center-point 폴백을 쓴다).
+  if (rt?.active && rt.surfaceReady) {
+    state.placer.regroundAll();
+    i += facilities.length;
+  } else {
+    for (const it of facilities) { it.groundH = groundAt(i++) ?? it.groundH; state.placer._draw(it); }
+  }
+  for (const p of posts) { p.groundH = groundAt(i++) ?? p.groundH; state.posts._applyMatrix(p); }
+  for (const c of custom) c.groundH = groundAt(i++) ?? c.groundH;
+  state.placer.groundHint = state.ents.groundH;
+  if (state.posts?.ctx) state.posts.ctx.groundHint = state.ents.groundH;
+  state.ents.buildTower();
+  state.ents.buildSector();
+  state.ents.buildHub();
+  state.posts?.redraw();
+  state.fpv?.sync();
+}
+
+// ───────────── 부트 ─────────────
+async function boot() {
+  setLoading(true, 'VWorld 위성영상 + 3D 지형 연결…');
+  const viewer = await initViewer((s) => { $('#loading-text').textContent = s; });
+  state.viewer = viewer;
+  window.__gp = state;
+  // 렌더 예외 하나로 지도 전체가 죽지 않도록 — 우리가 얹은 효과부터 걷어내고 되살린다
+  state.renderGuard = installRenderGuard(viewer, { toast });
+  // 저장해 둔 품질 프리셋을 첫 프레임 전에 적용한다 — 저사양 장비가 고품질로 한 번 그려 보고
+  // 나서 낮추면, 그 한 번에 이미 「멈춘 앱」 인상을 남긴다.
+  state.qualityId = applyQuality(viewer, savedQualityId()).id;
+  startFpsMeter(viewer, (fps) => {
+    const el = $('#quality-fps');
+    if (el) el.textContent = `${fps.toFixed(0)} fps`;
+  });
+  installTerrainModelAxisResolver(Cesium); // VISTA 모델 축 보정 패치
+  setInterval(() => { if (document.hidden) { try { viewer.render(); } catch (_) {} } }, 400);
+
+  state.ents = new SiteEntities(viewer);
+
+  setLoading(true, 'GP·허브 지반고 측량…');
+  const cartos = [
+    Cesium.Cartographic.fromDegrees(SITE.gp.lon, SITE.gp.lat),
+    Cesium.Cartographic.fromDegrees(SITE.hub.lon, SITE.hub.lat),
+  ];
+  try { await sampleTerrainDetailed(viewer.terrainProvider, cartos); } catch (e) { console.warn(e); }
+  state.ents.groundH = cartos[0].height ?? 0;
+  state.ents.hubGroundH = cartos[1].height ?? 0;
+  state.ents.buildTower();
+  state.ents.buildSector();
+  state.ents.buildHub();
+
+  // 1인칭은 관측점 계약만 안다 — 무엇이 가려져야 하는지는 관측점이 스스로 안다.
+  state.fpv = new FirstPersonView(viewer, {
+    defaultVantage: () => getVantage(state.fpvSel) ?? towerVantage(),
+    resolveVantage: (id) => getVantage(id),
+    // 1인칭 HUD 는 지어내지 않는다 — 실효거리·표적 판정·환경을 전부 여기서 읽는다
+    state,
+    renderGuard: state.renderGuard,
+    toast,
+    openFeed: (src) => state.sensorFeed?.open(src),
+    onSpotrep: (rep) => showSpotrep(rep),
+  });
+  state.fpv.onEnter = () => renderFpvSwitch();
+  // 진입 시엔 enterFpv()가 목록을 다시 그려 "1인칭 중" 안내를 띄운다 — 종료할 때도
+  // 같은 안내를 걷어야 한다(퀵독 1인칭 버튼으로 종료하면 이 콜백이 유일한 경로다).
+  state.fpv.onExit = () => { if ($('#page-twin').classList.contains('active')) renderVantageList(); };
+  // 지도 인스펙터·컨텍스트 메뉴·외부 진입점이 모두 같은 문을 쓴다
+  state.enterFpv = (id) => enterFpv(id);
+  state.listVantages = () => listVantages();
+
+  state.copiedUid = null;
+  state.placer = new PlacementManager(viewer, async (arr) => {
+    // GP 정밀지형이 켜져 있으면 렌더되는 GLB 표면고로 접지 — 그래야 건물이 실제 지형 위에
+    // 정확히 앉는다(라이브 DEM 공급자는 GLB와 표고 기준이 달라 공중부양/침하 발생).
+    const rt = state.realTerrain;
+    if (rt?.active && rt.surfaceReady) {
+      let miss = false;
+      for (const c of arr) {
+        const h = rt.surfaceHeightAt(Cesium.Math.toDegrees(c.longitude), Cesium.Math.toDegrees(c.latitude));
+        if (Number.isFinite(h)) c.height = h; else { miss = true; c.height = NaN; }
+      }
+      if (miss) await sampleTerrainDetailed(viewer.terrainProvider, arr.filter((c) => !Number.isFinite(c.height)));
+      return;
+    }
+    await sampleTerrainDetailed(viewer.terrainProvider, arr);
+  });
+  state.placer.gpRef = { lng: SITE.gp.lon, lat: SITE.gp.lat }; // 배치 검증 기준점
+  state.placer.groundHint = state.ents.groundH;                 // 고스트 라벨 고도
+  state.placer.onChange = () => {
+    refreshPlacedList();
+    if ($('#page-twin').classList.contains('active')) renderVantageList();
+    if (state.fpv.active) renderFpvSwitch();
+    // 배치를 고치면 타격 판정도 따라 바뀐다 — 그게 이 시뮬레이션의 목적이다
+    strikeReassess();
+    // 부지 조성(정지 비탈면·접근로·울타리·피규어)은 배치가 바뀌면 같이 바뀐다.
+    // 시설 하나를 옮기면 그 아래 비탈면도 접근로도 달라지는 것이 맞다.
+    state.siteWorks?.schedule();
+    state.store?.commit();
+  };
+
+  setLoading(true, '침투 축선 지형 클램프·경사 분석…');
+  // 오프라인일 땐 이 지형 조회(ArcGIS Elevation의 가용성(tilemap) 왕복)가 온라인보다
+  // 훨씬 느려질 수 있다 — 실측으로 확인됨(같은 조회가 수십ms~수 초까지 들쭉날쭉). 이걸
+  // await 로 막아 두면 부팅 전체(state.infil·state.ipb 생성 포함)가 그만큼 늦게 끝나고,
+  // 그동안 화면은 로딩 토스트만 뜬 채 아무 조작도 안 먹는 것처럼 보인다(실제로 멈춘 게
+  // 아니라 이 한 await 를 기다리는 것뿐이지만 사용자 입장에서는 구분이 안 된다).
+  // 오프라인이면 부팅을 막지 않고 백그라운드로 돌리고, 끝나면 관련 화면만 새로고침한다.
+  const bootOffline = Boolean(globalThis.__GP_CONFIG__?.OFFLINE_TILES) || !navigator.onLine;
+  if (bootOffline) {
+    prepareRoutes(viewer)
+      .then(() => { state.infil?.rebuild(); renderInfilTab(); })
+      .catch((e) => console.warn('[boot] 오프라인 침투축선 준비 실패', e));
+  } else {
+    await prepareRoutes(viewer);
+  }
+  // 사용자 작도 축선 — 저장본 재등록 후 리허설·IPB·워게임이 함께 소비
+  state.routeSketch = new RouteSketch(viewer);
+  state.routeSketch.onStatus = (s) => { if (s) toast(s, 4200); };
+  state.routeSketch.onDone = (rd) => {
+    state.infil.rebuild();
+    renderInfilTab();
+    toast(`「${rd.route.name.split(' — ')[0]}」 등록 — ${(rd.totalM / 1000).toFixed(1)}km · 경사 P95 ${rd.slopeP95.toFixed(1)}° · 리허설·작전분석·워게임에 반영됨`, 6000);
+  };
+  await state.routeSketch.restoreAll();
+  state.infil = new InfilSim(viewer, state.ents);
+  state.infil.onDetect = logDetect;
+  state.infil.rebuild();
+
+  state.ipb = new IPB(viewer, () => state.ents.groundH);
+
+  // ─── SitePlan 영속화 + Undo/Redo (Scaffolda 상태 모델) ───
+  // planId = 세션 id. 좌측 상단 스위처가 관리하는 세션 레지스트리에서 지금 활성 세션을 읽는다.
+  state.store = new SitePlanStore({
+    planId: sessionRegistry.getActiveId(),
+    placer: state.placer,
+    getTowerHeight: () => state.ents.towerHeight,
+    setTowerHeight: (h) => setTowerHeight(h),
+    ipb: state.ipb,
+    getMission: () => state.mission,
+    setMission: (mission) => { state.mission = normalizeMissionScenario(mission); },
+    getTrainingEvidence: () => state.training?.getPlanReference?.() ?? null,
+    setTrainingEvidence: (reference) => state.training?.restorePlanReference?.(reference),
+  });
+  state.store.onStatus = (msg) => { flashSaveChip(msg); sessionRegistry.touch(state.store.planId); };
+  state.store.onHistoryChange = (u, r) => updateHistoryButtons(u, r);
+  window.addEventListener('pagehide', () => state.store.flushPendingSave({ remote: false }));
+  void sessionRegistry.hydrateRemote(); // 서버 사본과 이름·즐겨찾기 병합 (best-effort)
+
+  // ─── KCTC/Warrior Platform 훈련근거 → 시설 소요 목업 ───
+  // 실제 연결 전에는 재현 가능한 합성 데이터만 사용한다. 후보를 클릭하면
+  // 이 화면의 3D 지형으로 이동하고, 소요를 확정하면 기존 배치 엔진으로 넘긴다.
+  state.training = new TrainingEvidenceLayer(viewer, {
+    toast,
+    switchTab,
+    onGeneratePlan: applyTrainingPlan,
+    onChange: () => state.store?.commit(),
+    isBlocked: () => !!(state.fpv?.active || state.walk?.active || state.drone?.active),
+    flyTo: (lon, lat, radiusM) => flyTo(
+      viewer, lon, lat - 0.002, state.ents.groundH + Math.max(260, radiusM * 3), 0, -48, 1.2,
+    ),
+    getRealTerrain: () => state.realTerrain,
+  });
+
+  // ─── GIS 계층: 레이어·태양·날씨·측정 ───
+  state.layers = new LayerManager(viewer);
+  state.realTerrain = new RealTerrainModel(viewer);
+  state.realTerrain.renderGuard = state.renderGuard; // 디오라마 하늘 그라디언트 셰이더 안전망
+  state.placer.terrain = state.realTerrain;   // 접지·경사(토목 판정)용 GLB 표면 참조
+  state.ents.realTerrain = state.realTerrain; // 부채꼴·거리링·허브 접지용 GLB 표면 참조
+  setActiveTerrain(state.realTerrain);        // 침투 축선 접지·경사판정용 GLB 표면 참조
+  if (state.routeSketch) state.routeSketch.realTerrain = state.realTerrain; // 위협축선 작도선 접지용
+  // 부지 조성 — 시설을 「지형 위에 놓인 물체」가 아니라 「기지」로 만드는 층.
+  // 정지 비탈면·접근로·외곽 울타리·축척 피규어를 지형 높이에서 직접 만든다.
+  state.siteWorks = new SiteWorks(viewer, {
+    placer: state.placer,
+    terrain: state.realTerrain,
+    gpRef: { lon: SITE.gp.lon, lat: SITE.gp.lat },
+    siteRadiusM: 450,
+  });
+  // 안개는 계곡 바닥에 고인다 — GP 능선 지반고가 아니라 그 아래 저지대가 기준이다.
+  // (SITE 는 북측을 217m 감제하는 능선 정상부다.)
+  // 바람·비 배경음 + 번개 천둥 — 환경(시간·계절·날씨)과 같은 상태 하나를 듣는다.
+  state.envAudio = new EnvironmentAudio();
+  state.weather = new WeatherFx(viewer, {
+    floorHeight: () => state.ents.groundH - 220,
+    renderGuard: state.renderGuard,
+    onLightning: (strength) => state.envAudio.thunder(strength),
+  });
+  // 환경(시간·계절·날씨)의 단일 권한. 씬 조명·안개·영상보정·강수는 전부 여기서 온다.
+  state.env = new EnvironmentController(viewer, {
+    site: { latitude: SITE.gp.lat, longitude: SITE.gp.lon, utcOffsetHours: 9 },
+    weather: state.weather,
+    audio: state.envAudio,
+    renderGuard: state.renderGuard,
+    year: 2026,
+    onChange: () => {
+      renderEnvSummary();
+      refreshEnvironmentPanel($('#env-mount-gis'), state.env);
+      // 날씨가 바뀌면 실효 부채꼴이 바뀐다 — 지도와 감시 탭이 같은 값을 본다.
+      // 기온이 바뀌면 한랭 보정으로 전력 요구도 바뀐다.
+      recomputePower();
+      state.posts?.redraw();
+      state.watchTab?.refresh();
+      // 겨울 경계를 넘으면 지형 GLB 를 적설 텍스처 변형으로 통째로 갈아 낀다
+      // (색조 블렌드만으론 경사별 눈 쌓임까지는 못 만든다).
+      state.realTerrain?.syncSeason(state.env.state);
+      // 디오라마(GP 정밀지형 격리 모드)는 skyBox·skyAtmosphere 를 꺼서 하늘이
+      // 통째로 비므로, 그 배경색·별을 환경 상태로 직접 칠한다 — 안 하면 정오든
+      // 자정이든 폭설이든 배경이 항상 같은 고정 검정으로 남는다.
+      state.realTerrain?.syncSky(state.env.state);
+    },
+  });
+  state.env.start();
+  state.assets = new AssetLayer(viewer, state.ents);
+  // 직접 배치 감시자산 — 환경 상태를 읽어 부채꼴 반경을 매번 실효거리로 다시 그린다
+  state.posts = new SensorPostLayer(viewer, {
+    sampleHeights: async (cartos) => {
+      await sampleTerrainDetailed(viewer.terrainProvider, cartos);
+    },
+    getEnvState: () => state.env?.state ?? null,
+    onChange: () => { recomputePower(); state.watchTab?.refresh(); strikeReassess(); savePosts(); },
+  });
+  state.posts.ctx.groundHint = state.ents.groundH;
+  // 전원 — 자산 목록·기온이 바뀔 때마다 다시 푼다. perfOf 가 이 결과를 읽고
+  // 차단된 자산은 실효거리 0 이 되므로, 탐지·로그·공백 분석이 함께 따라온다.
+  state.posts.ctx.isOffline = (uid) => state.powerOff.has(uid);
+  recomputePower();
+  // 조명은 배치가 아니라 **사건**이다 — 부채꼴이 그 30초 동안만 커졌다 돌아온다.
+  // 판정 기준은 「관측점이 밝은가」가 아니라 「내가 보는 땅이 밝은가」 = 감시 부채꼴.
+  state.posts.ctx.isIlluminated = (post, type) => state.fireSupport.illuminatesFan(
+    { lon: post.lon, lat: post.lat, aimAz: post.aimAz, fovDeg: type.fov, rangeM: type.dri[0] },
+    performance.now(), { distM, azimuthDeg, azDelta });
+  state.fireSupport.onChange = () => { state.posts?.redraw(); state.watchTab?.refresh(); };
+  state.flareLayer = new FlareLayer(viewer, state.fireSupport);
+  // 다 탄 조명탄을 걷어내고, 꺼지는 그 순간 부채꼴을 원래 밤으로 되돌린다
+  setInterval(() => {
+    if (state.fireSupport.prune(performance.now())) { state.posts?.redraw(); state.watchTab?.refresh(); }
+  }, 1000);
+  // 드론 편대 — 떠 있는 기체는 초소와 똑같은 감시자산이다(상시 감시가 함께 묻는다)
+  state.fleet = new DroneFleet(viewer, {
+    state, toast,
+    onChange: () => { state.manage?.refresh(); state.watchTab?.refresh(); },
+  });
+  state.fleet.seed(2);
+
+  // 자산·편대 관리 팝업 — 떠 있는 채로 지도를 조작할 수 있어야 한다
+  state.manage = new ManagePanel({
+    state, toast,
+    enterFpv: (id) => { cancelTour(); enterFpv(id); },
+    openFeed: (src) => state.sensorFeed?.open(src),
+    flyTo: (lon, lat, groundH) => viewer.camera.flyTo({
+      destination: Cesium.Cartesian3.fromDegrees(lon, lat - 0.004, (groundH ?? 0) + 420),
+      orientation: { heading: 0, pitch: Cesium.Math.toRadians(-42) }, duration: 1.4,
+    }),
+    enterDroneView: (uid) => enterDroneView(uid),
+    // 감시자산·편대 철거는 SitePlanStore 이력 밖이라 Ctrl+Z 로 안 돌아온다 — 관리 창은
+    // 이 자산을 손보는 가장 흔한 자리라 여기서 지워지는 건이 가장 많다. mapInspector 와
+    // 같은 두 번 눌러 확정하는 무장 확인을 태운다.
+    armDestructive,
+  });
+
+  // 상시 감시 — 1인칭 화면이 꺼져 있어도 배치된 자산은 계속 판정한다.
+  // 그 판정의 변화가 곧 사건이고, 사건의 열이 곧 「이 배치가 작동했는가」의 답이다.
+  state.watch = new WatchRoom({
+    state, toast,
+    onLog: (log) => renderWatchLog(log),
+  });
+  // 떠 있는 드론도 감시자산이다 — 초소와 같은 규칙으로 묻고, 같은 로그에 남는다
+  state.watch.extraAssets = () => state.fleet?.watchAssets() ?? [];
+  state.watch.extraPerf = (a) => {
+    const spec = state.fleet?.specOf(a.uid);
+    if (!spec) return null;
+    const env = state.env?.state;
+    return env ? effectiveRanges(spec, atmosphereOf(env)) : null;
+  };
+  state.watch.start();
+  state.threatLayer = new ThreatRingLayer(viewer, () => state.ents.groundH);
+  state.gapLayer = new GapClosureLayer(viewer);
+  state.walk = new WalkController(viewer, {
+    getGroundH: () => state.ents.groundH,
+    getTowerH: () => state.ents.towerHeight,
+    getBuildings: () => state.placer.items,
+    getRealTerrain: () => state.realTerrain,
+    onEnterTower: () => { enterFpv('tower'); },
+    onInterior: (item) => state.placer.setShellVisible(item?.uid ?? null),
+  });
+  state.walk._toast = toast;
+  // 드론 조종석 계기도 1인칭과 같은 HUD 엔진을 쓴다 — 값은 전부 여기서 읽는다
+  state.drone = new DroneCam(viewer, () => state.ents.groundH, {
+    state, renderGuard: state.renderGuard, toast,
+  });
+  // 도보/드론 시점도 1인칭(fpv-exit)과 같이 눈에 보이는 종료 버튼이 있어야 한다 —
+  // ESC 는 하단 힌트 줄 글자로만 적혀 있어 놓치기 쉽다. 두 컨트롤러가 오버레이
+  // 하나(#walk-overlay)를 같이 쓰므로, 지금 활성인 쪽의 exit()를 그대로 부른다.
+  document.querySelector('#wk-exit').onclick = () => {
+    if (state.walk.active) state.walk.exit();
+    else if (state.drone.active) state.drone.exit();
+  };
+
+  // 맵 다이렉트 인스펙터: 타워/시설/자산 거치 클릭 → 그 자리 설정 팝업
+  state.mapInspector = new MapInspector(viewer, {
+    state,
+    setTowerHeight: (h) => setTowerHeight(h),
+    towerCost: (h) => towerCostEok(h),
+    toast,
+    switchTab,
+    // 지도에서 감시탑·시설·거치대를 클릭한 그 자리에서 1인칭으로 들어간다
+    enterFpv: (id) => { cancelTour(); enterFpv(id); },
+    // 감시자산 철거는 배치(SitePlanStore)와 달리 Ctrl+Z 되돌리기가 없다 —
+    // 「전체 철거」와 같은 두 번 눌러 확정하는 무장 확인을 여기도 태운다.
+    armDestructive,
+  });
+
+  // 지도 우클릭 컨텍스트 메뉴("여기서 1인칭 보기" 등) + 선택 시설 키보드 니지
+  state.mapCtx = initMapContext(viewer, { state, toast, switchTab });
+
+  // 센서 피드 — 자산의 눈으로 보는 다중 팝업 (EO/IR/조준경/레이더 PPI/드론)
+  state.sensorFeed = new SensorFeed(viewer, { state, toast });
+
+  // 교전 제원: 침투 유닛 클릭 → FIRE MISSION 카드
+  const fireHandler = new Cesium.ScreenSpaceEventHandler(viewer.canvas);
+  fireHandler.setInputAction((ev) => {
+    if (state.walk.active || state.fpv.active) return;
+    const picked = viewer.scene.pick(ev.position);
+    const id = picked?.id?.id;
+    // VISTA 배치 런타임 엔티티 ID 규약: terrain-placement-{unitId} (+ 보조 엔티티 접두)
+    const m = id && id.match(
+      /^terrain-placement-(?:ground-shadow-|selection-ring-|body-line-|barrel-line-|dust-|label-)?(r\d)$/);
+    if (!m) return;
+    openFireCard(m[1]);
+  }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+  // 작은 삼각형만 노리는 대신 머리띠 어디를 눌러도 접힌다 — 손이 덜 아프다
+  $('#watch-log .wg-head').onclick = () => {
+    const box = $('#watch-log');
+    box.classList.toggle('collapsed');
+    box.classList.remove('ping');
+  };
+  $('#spot-close').onclick = () => $('#spot-card').classList.add('hidden');
+  $('#spot-png').onclick = () => {
+    if (state.spotrep?.png) downloadDataUrl(state.spotrep.png, `${state.spotrep.base}.png`);
+  };
+  $('#spot-txt').onclick = () => {
+    if (!state.spotrep) return;
+    downloadDataUrl(
+      `data:text/plain;charset=utf-8,${encodeURIComponent(state.spotrep.text)}`,
+      `${state.spotrep.base}.txt`);
+  };
+  $('#spot-copy').onclick = async () => {
+    if (!state.spotrep) return;
+    try {
+      await navigator.clipboard.writeText(state.spotrep.text);
+      toast('보고문을 클립보드에 복사했습니다', 2400);
+    } catch { toast('복사 실패 — 텍스트를 직접 선택해 주세요', 3200); }
+  };
+  $('#fire-close').onclick = () => $('#fire-card').classList.add('hidden');
+  $('#eval-close').onclick = () => hideEvalPanel();
+
+  state.measure = new MeasureTool(viewer);
+  state.measure.realTerrain = state.realTerrain; // 고도 프로파일·LOS 판정용 GLB 표면 참조
+  state.measure.onStatus = (s) => { if (s) toast(s, 3500); };
+  state.measure.onMode = (m) => syncMeasureButtons(m);
+  state.measure.onProfile = (prof) => {
+    $('#profile-card').classList.remove('hidden');
+    drawProfileChart($('#profile-canvas'), prof);
+    $('#profile-stats').innerHTML = `
+      <span>수평 <b>${(prof.totalD / 1000).toFixed(2)}km</b></span>
+      <span>표면 <b>${(prof.surf / 1000).toFixed(2)}km</b></span>
+      <span>상승 <b>+${Math.round(prof.gain)}m</b></span>
+      <span>표고 <b>${Math.round(prof.minH)}–${Math.round(prof.maxH)}m</b></span>
+      <span>가시선 <b style="color:${prof.visible ? 'var(--ok)' : 'var(--bad)'}">${prof.visible ? '관측 가능' : '지형 차폐'}</b></span>`;
+  };
+  $('#profile-close').onclick = () => $('#profile-card').classList.add('hidden');
+
+  // 지형 소스 교체 → 분석 캐시 전면 재구축
+  state.layers.onTerrainChange = async () => {
+    clearViewshedCache();
+    clearRoutes();
+    state.grid = null; state.gridHeight = null; state.coveragePct = null;
+    state.covEngine = null;                 // LOS 마스크는 지형에 매인 캐시다
+    state.watchTab?.invalidate();
+    setLoading(true, '새 지형으로 지반고 재측량…');
+    // 지반고는 지형이 정하는 값이다 — 소스를 바꿔 놓고 옛 표고를 들고 있으면
+    // 감시탑이 허공에 뜨고, 배치 비용·1인칭 관측고·부채꼴이 전부 옛 지형 기준으로 남는다.
+    await remeasureGroundHeights();
+    setLoading(true, '새 지형으로 축선 경사 재분석…');
+    await prepareRoutes(viewer);
+    await state.routeSketch.restoreAll();   // 작도 축선도 새 지형으로 재클램프
+    state.infil.rebuild();
+    setLoading(false);
+    renderInfilTab();
+    if ($('#page-twin').classList.contains('active')) renderVantageList();
+    state.watchTab?.refresh();
+    updateHud();
+    toast('지형 소스 교체 완료 — 지반고·축선 재측량됨, 가시영역은 다음 계산 시 새 지형 사용');
+  };
+
+  // ─── 상태바 (MGRS·좌표·표고) ───
+  const sbHandler = new Cesium.ScreenSpaceEventHandler(viewer.canvas);
+  let sbLast = 0;
+  sbHandler.setInputAction((mv) => {
+    const now = performance.now();
+    if (now - sbLast < 90) return;
+    sbLast = now;
+    const rt = state.realTerrain;
+    let cart = null;
+    if (rt?.active && viewer.scene.pickPositionSupported) {
+      cart = viewer.scene.pickPosition(mv.endPosition);
+    } else {
+      const ray = viewer.camera.getPickRay(mv.endPosition);
+      cart = ray && viewer.scene.globe.pick(ray, viewer.scene);
+    }
+    if (!cart) return;
+    const c = Cesium.Cartographic.fromCartesian(cart);
+    const lon = Cesium.Math.toDegrees(c.longitude), lat = Cesium.Math.toDegrees(c.latitude);
+    $('#sb-mgrs').textContent = `MGRS ${toMGRS(lon, lat)}`;
+    $('#sb-ll').textContent = `${lat.toFixed(5)}°N ${lon.toFixed(5)}°E`;
+    $('#sb-elev').textContent = `표고 ${Math.round(c.height)}m`;
+  }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+  viewer.camera.changed.addEventListener(() => {
+    $('#sb-cam').textContent = `고도 ${Math.round(viewer.camera.positionCartographic.height).toLocaleString()}m`;
+  });
+  setInterval(() => {
+    const el = $('#sb-clock');
+    if (!el) return;
+    // 예행 시계 — 벽시계가 아니라 환경 모델이 서 있는 시각이다.
+    el.textContent = state.env ? `☀ ${state.env.headline()}`
+      : new Date().toLocaleTimeString('ko-KR', { hour12: false });
+  }, 1000);
+
+  // ─── v13 지도 전문 크롬: 도구 툴바·나침반·축척바·미니맵·MGRS 격자·DTG ───
+  state.mgrsGrid = new MgrsGrid(viewer);
+  state.mgrsGrid.realTerrain = state.realTerrain; // GP 블렌더 지형 표면 참조(격자선 접지)
+  state.chrome = initMapChrome(viewer, {
+    site: { lon: SITE.gp.lon, lat: SITE.gp.lat, groundH: state.ents.groundH },
+    grid: state.mgrsGrid,
+    toast,
+    getRealTerrain: () => state.realTerrain,
+    home: () => {
+      cancelTour();
+      flyTo(viewer, SITE.gp.lon, SITE.gp.lat - 0.014, state.ents.groundH + 1500, 0, -38);
+    },
+  });
+
+  // ─── v16 워게임 판정 레이어 ───
+  state.wargameDs = new Cesium.CustomDataSource('wargame');
+  viewer.dataSources.add(state.wargameDs);
+  state.wargameResults = null;
+  state.wargameSel = 0;
+  $('#aar-close').onclick = () => {
+    $('#aar-card').classList.add('hidden');
+    state.wargameDs.entities.removeAll();
+  };
+
+  // ─── v14 COA 전술 스케치 + 작전 브리핑 ───
+  state.coa = new CoaSketch(viewer, () => state.ents.groundH);
+  state.coa.realTerrain = state.realTerrain; // GP 블렌더 지형 표면 참조(COA 도식 접지)
+  state.coa.onStatus = (s) => {
+    if (s) toast(s, 3500);
+    else $$('#coa-tools .coa-tool').forEach((x) => x.classList.remove('on'));
+  };
+  state.coa.onChange = () => renderCoaList();
+  state.brief = new Briefing(viewer);
+
+  // ─── v13 명령 팔레트 (Ctrl+K) ───
+  state.palette = new CommandPalette();
+  const tabNames = { twin: '트윈', gis: '지도', training: '훈련근거', build: '배치', watch: '감시', infil: '침투', ipb: '작전분석', fires: '화력', decision: '결심', guide: '설명서' };
+  state.palette.register(Object.entries(tabNames).map(([id, name]) => ({
+    group: '탭 이동', label: `${name} 탭 열기`, keywords: id, run: () => switchTab(id),
+  })));
+  state.palette.register([
+    { group: '이동', label: '기준 시점 (홈 뷰)', keywords: 'home', run: () => state.chrome.home() },
+    { group: '이동', label: '정사 탑다운 전환', keywords: 'topdown 2d', run: () => state.chrome.topDown() },
+    { group: '이동', label: '북 정렬', keywords: 'north', run: () => state.chrome.northUp() },
+    {
+      group: '이동', label: '시네마틱 투어', keywords: 'tour',
+      run: () => { cancelTour(); cinematicTour(viewer, SITE.gp, state.ents.groundH, state.ents.towerHeight, (s) => s && toast(`투어: ${s}`, 3200)); },
+    },
+    {
+      group: '관리', label: '드론 편대 관리', keywords: 'drone fleet uas 편대 드론 관리 배터리',
+      run: () => state.manage?.openFleet(),
+    },
+    {
+      group: '관리', label: '전원 수지 — 몇 개를 켤 수 있나', keywords: 'power 전원 발전기 정전 부하',
+      run: () => {
+        const b = recomputePower();
+        toast(`전원 ${b.servedW}W / ${b.supplyW}W · ${b.note}`, 6000);
+        switchTab('watch');
+      },
+    },
+    {
+      group: '관리', label: '선택 감시자산 관리', keywords: 'asset manage 자산 관리 초소',
+      run: () => {
+        const uid = state.posts?.selectedUid ?? state.posts?.list()[0]?.uid;
+        if (!uid) { toast('배치된 감시자산이 없습니다', 2800); return; }
+        state.manage?.openPost(uid);
+      },
+    },
+    { group: '시점', label: '감시탑 1인칭 승탑', keywords: 'fpv tower 1인칭', run: () => enterFpv('tower') },
+    {
+      group: '시점', label: 'TOD 열상 시점 — 첫 열상자산', keywords: 'tod ir 열상 thermal 야간',
+      run: () => {
+        const v = listVantages().find((x) => x.optic?.id === 'tod');
+        if (!v) { toast('배치된 열상(TOD) 자산이 없습니다 — 감시 탭에서 배치하세요', 4200); return; }
+        enterFpv(v.id);
+      },
+    },
+    {
+      group: '시점', label: '관제벽 열기 — 배치 자산 전 채널', keywords: 'cctv wall 관제 피드 feed 화면',
+      run: () => state.sensorFeed?.openWall(),
+    },
+    {
+      group: '시점', label: '표적 추적 (1인칭)', keywords: 'track lock 추적 표적 항적',
+      run: () => (state.fpv?.active ? state.fpv.lockNearest() : toast('먼저 1인칭 관측에 들어가세요', 2800)),
+    },
+    {
+      group: '시점', label: '교차표적지정 — 다른 자산에 인계', keywords: 'cue handover 인계 교차',
+      run: () => (state.fpv?.active ? state.fpv.crossCue() : toast('먼저 1인칭 관측에 들어가세요', 2800)),
+    },
+    {
+      group: '시점', label: '조명 요청 — 표적 위로 조명탄', keywords: 'flare 조명 야간 illumination',
+      run: () => (state.fpv?.active ? state.fpv.requestIllumination() : toast('먼저 1인칭 관측에 들어가세요', 2800)),
+    },
+    {
+      group: '보고', label: '관측보고(SPOTREP) 생성', keywords: 'spotrep 관측보고 보고 캡처 salute',
+      run: () => (state.fpv?.active ? state.fpv.captureSpotrep() : toast('먼저 1인칭 관측에 들어가세요', 2800)),
+    },
+    { group: '시점', label: '1인칭 — 선택 관측점 진입', keywords: 'fpv vantage 초소 관측점', run: () => enterFpv(state.fpvSel) },
+    { group: '시점', label: '1인칭 관측점 지도에서 지정', keywords: 'vantage pick 관측점 초소', run: () => { switchTab('twin'); beginVantagePick(); } },
+    { group: '시점', label: '도보 정찰 (WASD)', keywords: 'walk', run: () => state.walk.enter() },
+    { group: '시점', label: '드론 정찰', keywords: 'drone', run: () => state.drone.enter() },
+    { group: '지도', label: 'MGRS 군사격자 토글', keywords: 'grid', run: () => toast(state.chrome.toggleGrid() ? 'MGRS 격자 표시' : 'MGRS 격자 해제') },
+    { group: '지도', label: '상황도 미니맵 토글', keywords: 'minimap', run: () => state.chrome.toggleMinimap() },
+    { group: '지도', label: '화면 캡처 PNG 저장', keywords: 'screenshot capture', run: () => state.chrome.screenshot() },
+    { group: '지도', label: '전체화면 전환', keywords: 'fullscreen', run: () => state.chrome.fullscreen() },
+    { group: '측정', label: '표면거리 측정', keywords: 'measure distance', run: () => { state.measure.setMode('distance'); toast('표면거리: 클릭으로 구간 추가 · 우클릭 종료'); } },
+    { group: '측정', label: '고도 프로파일 · 가시선', keywords: 'profile los', run: () => { state.measure.setMode('profile'); toast('고도 프로파일: 시점·종점 2회 클릭'); } },
+    { group: '측정', label: '면적 측정', keywords: 'area', run: () => { state.measure.setMode('area'); toast('면적: 꼭짓점 클릭 · 우클릭으로 폐합'); } },
+    { group: '측정', label: '측정 지우기', keywords: 'clear', run: () => { state.measure.clear(); $('#profile-card').classList.add('hidden'); } },
+    { group: '브리핑', label: '작전 브리핑 시작 (현 계획 기반)', keywords: 'briefing present', run: () => state.brief.present(buildBriefingSteps()) },
+    { group: '브리핑', label: 'COA 전술 스케치 열기', keywords: 'coa sketch', run: () => { switchTab('ipb'); toast('작전분석 탭 하단 「전술 스케치」에서 도구를 선택하세요'); } },
+    { group: '브리핑', label: '작전계획 종합 보고서 (인쇄/저장)', keywords: 'report print opord', run: () => openOperationReport() },
+    { group: '분석', label: '탐지·교전 판정 (워게임 AAR)', keywords: 'wargame aar detect', run: () => { switchTab('infil'); runWargame(); } },
+    { group: '분석', label: '위협 축선 작도 시작', keywords: 'route sketch draw', run: () => { switchTab('infil'); $('#route-sketch-begin')?.click(); } },
+    { group: '계획', label: 'A3 배치계획도 미리보기', keywords: 'blueprint', run: () => { switchTab('build'); openBlueprintModal(); } },
+    { group: '계획', label: '자동 배치 (지형점수 greedy)', keywords: 'auto layout', run: () => { switchTab('build'); autoLayout(); } },
+    { group: '계획', label: '실행 취소 (Undo)', hint: 'Ctrl+Z', run: () => state.store.undo() },
+    { group: '계획', label: '다시 실행 (Redo)', hint: 'Ctrl+Y', run: () => state.store.redo() },
+  ]);
+  // 단축키 안내(?) — 지도를 보고 있는 사람이 설명서 탭을 열지 않고도 조작을 알 수 있게
+  state.shortcuts = initShortcutHelp({ isBlocked: () => state.palette.isOpen });
+  state.palette.register([
+    { group: '도움말', label: '조작 · 단축키 안내', hint: '?', keywords: 'shortcut help 단축키', run: () => state.shortcuts?.open() },
+  ]);
+  $('#cmdk-hint').onclick = () => state.palette.open();
+  window.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+      if (state.fpv.active || state.walk.active || state.drone.active) return;
+      e.preventDefault();
+      if (state.palette.isOpen) state.palette.close();
+      else state.palette.open();
+    }
+  });
+
+  wireTabs();
+  wireTimeline();
+  wireMapInteractions();
+  $('#panel-toggle').onclick = () => $('#app').classList.toggle('panel-hidden');
+  // 도면 모달 배선
+  $('#bp-close').onclick = () => $('#bp-modal').classList.add('hidden');
+  $('#bp-download').onclick = () => {
+    if (_bpResult) {
+      downloadBlueprint(_bpResult);
+      toast(`배치계획도 PNG 다운로드 — 축척 1:${_bpResult.scaleDenom}`);
+    }
+  };
+  $('#bp-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'bp-modal') $('#bp-modal').classList.add('hidden');
+  });
+
+  // 참여형 사용설명서 (설명서 탭 + 코치 카드)
+  state.tutorial = new Tutorial({
+    getState: () => state,
+    switchTab,
+    toast,
+  });
+  state.tutorial.onProgress = () => {
+    if ($('#page-guide').classList.contains('active')) renderGuideTab();
+  };
+  // 컨텍스트 도움말: 탭이 리렌더될 때마다 섹션 제목에 ? 뱃지 주입
+  injectHelpBadges($('#panel-body'), state.tutorial);
+  new MutationObserver(() => {
+    clearTimeout(state._helpT);
+    state._helpT = setTimeout(() => injectHelpBadges($('#panel-body'), state.tutorial), 250);
+  }).observe($('#panel-body'), { childList: true, subtree: true });
+  try {
+    const seen = localStorage.getItem('gp_guide_seen') ?? '';
+    if ((NEW_FEATURES[0]?.date ?? '') > seen) $('.tab-guide')?.classList.add('has-new');
+    if (!localStorage.getItem('gp_first_visit_done')) {
+      localStorage.setItem('gp_first_visit_done', '1');
+      setTimeout(() => toast('처음이신가요? 우측 상단 「설명서」 탭에서 직접 해보는 5분 가이드를 시작하세요 🧭', 7000), 2500);
+    }
+  } catch { /* noop */ }
+
+  // 감시 탭 — 배치·커버리지·날씨 스윕. 계산은 전부 다른 모듈이 한다.
+  state.watchTab = createSurveillanceTab({
+    state, toast, setLoading, ensureGrid, setPostPickType,
+    enterFpv: (id) => { cancelTour(); enterFpv(id); },
+    switchTab,
+    drawPostCoverage,
+    clearOverlay,
+    renderEnv: () => {
+      renderEnvSummary();
+      refreshEnvironmentPanel($('#env-mount-gis'), state.env);
+    },
+  });
+
+  renderTwinTab();
+  renderGisTab();
+  state.training.render();
+  renderBuildTab();
+  state.watchTab.render();
+  migrateLegacyPostsStorage();
+  await restorePosts();
+  restoreInfilVisibility();
+  renderInfilTab();
+  renderIpbTab();
+  renderFires();
+  renderDecision();
+  renderForecast();
+  renderGuideTab();
+  initUxShell();   // 커맨드 브리지 셸: 레일·아코디언·그립
+  updateHud();
+
+  setLoading(false);
+  window.__gp = state;   // 헤드리스 검증용 핸들 (orca eval)
+  const intro = document.getElementById('intro');
+  if (intro) { intro.classList.add('is-leaving'); setTimeout(() => intro.remove(), 800); }
+  // 저장본 자동 복원: 서버 사본이 더 최신이면 우선하고, API가 없으면 localStorage로 계속 동작
+  const remotePlan = await state.store.hydrateRemote();
+  renderPlanProvenance();
+  const savedPlan = remotePlan ?? state.store.loadSaved();
+  if (savedPlan && (savedPlan.items?.length || savedPlan.ipb?.length || savedPlan.mission)) {
+    state.store.applySnapshot(savedPlan);
+    toast(`저장된 계획 복원 — 시설 ${savedPlan.items?.length ?? 0}동 · 타워 ${savedPlan.towerHeight}m`, 4200);
+  } else {
+    toast('GP 디지털트윈 준비 완료 — 타워에 올라가 보세요', 4000);
+  }
+  state.store.prime();
+
+  // 딥링크
+  const demo = new URLSearchParams(location.search).get('demo');
+  if (demo === 'fpv') {
+    enterFpv('tower');
+  } else if (demo === 'infil') {
+    switchTab('infil');
+    await ensureGrid();
+    state.infil.rebuild();
+    state.infil.setTime(0.4);
+    $('#timeline-bar').classList.remove('hidden');
+    $('#sim-time').value = 40;
+    flyTo(viewer, SITE.gp.lon, SITE.gp.lat + 0.033, 4000, 180, -44, 1.5);
+  } else if (demo === 'ipb') {
+    switchTab('ipb');
+    await ensureGrid();
+    state.ipb.autoSuggest(state.grid, 'walk');
+    drawViewshedOverlay();
+    renderIpbTab();
+    flyTo(viewer, SITE.gp.lon, SITE.gp.lat + 0.028, 5200, 180, -50, 1.5);
+  }
+}
+
+boot().catch((e) => {
+  console.error(e);
+  $('#loading-text').textContent = '초기화 실패: ' + e.message;
+});
+

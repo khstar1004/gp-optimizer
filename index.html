@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#081019" />
+    <title>GP Digital Twin</title>
+    <!-- 전부 로컬 서빙(오프라인 대응) — CDN 의존 제거. Cesium/폰트가 인터넷에 있으면
+         랜선을 뽑는 순간 앱이 하얀 화면이 된다. node_modules/cesium(1.119 고정)와
+         assets/fonts 를 server.cts 가 정적 마운트한다. -->
+    <link rel="stylesheet" href="/assets/fonts/fonts.css" />
+    <script>window.CESIUM_BASE_URL = '/vendor/cesium/';</script>
+    <script src="/vendor/cesium/Cesium.js"></script>
+    <link rel="stylesheet" href="/vendor/cesium/Widgets/widgets.css" />
+    <script src="/config.js"></script>
+    <script>
+      // Legacy VISTA/KAIROS bundles consume the same runtime configuration.
+      // 모델 이름은 박아 두지 않는다 — server.cts 가 로컬 Ollama 에 실제로 설치된
+      // 모델을 물어 /config.js 로 내려준다. 없는 이름을 고정하면 AI 기능이 조용히
+      // 404 로 죽고 사용자는 「원래 안 되는 기능」으로 읽는다.
+      var __gpCfg = globalThis.__GP_CONFIG__ || {};
+      var __gpModel = __gpCfg.OLLAMA_MODEL || 'gemma4:e4b';
+      globalThis.__SCAFFOLDA_ENV__ = {
+        VWorldAPIKey: __gpCfg.VWORLD_KEY || '',
+        VITE_OLLAMA_MODEL: __gpModel, VITE_OLLAMA_BASE_URL: '/ollama',
+        MODE: 'production', DEV: false, PROD: true,
+      };
+      globalThis.__KAIROS_ENV__ = {
+        BASE_URL: '/', VITE_SUDO_OLLAMA_URL: '/ollama',
+        VITE_SUDO_VLM_MODEL: __gpModel, VITE_SUDO_ASSISTANT_MODEL: __gpModel,
+        MODE: 'production', DEV: false, PROD: true,
+      };
+    </script>
+    <script>
+      window.__errs = [];
+      window.addEventListener('error', (event) => {
+        window.__errs.push(`ERR: ${event.message} @${event.filename}:${event.lineno}`);
+      });
+      window.addEventListener('unhandledrejection', (event) => {
+        const reason = event.reason;
+        window.__errs.push(`REJ: ${String((reason && (reason.stack || reason.message)) || reason).slice(0, 400)}`);
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      setTimeout(() => {
+        const el = document.getElementById('intro');
+        if (el && !el.classList.contains('is-leaving')) el.classList.add('is-leaving');
+      }, 12000);
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

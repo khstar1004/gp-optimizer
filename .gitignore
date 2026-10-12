@@ -1,0 +1,23 @@
+node_modules/
+dist/
+server.log
+*.log
+\.env
+\.env.*
+!\.env.example
+*.tmp
+*.tmp.js
+data/vworld-cache/
+data/tile-cache/
+data/plans/
+data/sessions/
+
+# GitHub 100MB 한도 초과 원본 — 런타임 미사용(압축본 gp_terrain_real.glb·fac_*.glb 사용)
+assets/models/*_raw.glb
+assets/models/usd/
+
+# Blender 지형 빌드 캐시 — 내려받은 타일·중간 산출물·백업(수 GB). 빌드 스크립트만 추적.
+data/blender_cache/**
+!data/blender_cache/*.py
+!data/blender_cache/*.mjs
+!data/blender_cache/*.mts

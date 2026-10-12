@@ -1,0 +1,49 @@
+{
+  "name": "gp-digital-twin-demo",
+  "version": "0.1.0",
+  "description": "임무기반 GP 시설·전력구조 최적화 디지털트윈 데모",
+  "private": true,
+  "scripts": {
+    "start": "npm run build && tsx server.cts",
+    "dev": "vite --host localhost",
+    "dev:server": "tsx server.cts",
+    "dev:all": "tsx scripts/dev.mts",
+    "test": "tsx --test",
+    "typecheck": "npm exec -- tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "build:scaffolda": "tsx scripts/build-scaffolda.mts",
+    "build:kairos": "tsx scripts/build-kairos.mts",
+    "vendor:kairos": "tsx scripts/vendor-kairos.mts",
+    "build:web": "vite build",
+    "build": "npm run build:scaffolda && npm run build:kairos && npm run build:web",
+    "smoke:server": "tsx scripts/smoke-server.mts",
+    "seed:offline": "tsx scripts/seed-offline-cache.mts",
+    "mcp:blender": "tsx scripts/mcp-blender-pipeline.mts",
+    "smoke:mcp-blender": "tsx scripts/smoke-mcp-blender.mts",
+    "fetch:polyhaven": "tsx scripts/fetch-polyhaven-textures.mts"
+  },
+  "devDependencies": {
+    "@gltf-transform/core": "^4.5.0",
+    "@gltf-transform/extensions": "^4.5.0",
+    "@gltf-transform/functions": "^4.5.0",
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "@types/node": "^26.4.1",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "delaunator": "^5.0.1",
+    "draco3dgltf": "^1.5.7",
+    "esbuild": "^0.28.2",
+    "martinez-polygon-clipping": "^0.7.3",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "zod": "^4.5.4"
+  },
+  "dependencies": {
+    "cesium": "1.119.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  }
+}

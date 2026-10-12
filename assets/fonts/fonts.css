@@ -1,0 +1,32 @@
+/* 로컬 폰트 — CDN(jsdelivr/Google Fonts) 의존 제거, 오프라인에서도 그대로 렌더된다.
+   Pretendard GOV: orioncactus/pretendard-gov v1.3.9 정적(비-dynamic-subset) 가변폰트.
+   Chakra Petch: Google Fonts v13, 실제 쓰이는 라틴 서브셋 3중량(500/600/700)만. */
+@font-face {
+  font-family: 'Pretendard GOV';
+  src: url('/assets/fonts/PretendardGOVVariable.woff2') format('woff2-variations'),
+       url('/assets/fonts/PretendardGOVVariable.woff2') format('woff2');
+  font-weight: 45 920;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Chakra Petch';
+  src: url('/assets/fonts/ChakraPetch-500.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Chakra Petch';
+  src: url('/assets/fonts/ChakraPetch-600.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Chakra Petch';
+  src: url('/assets/fonts/ChakraPetch-700.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}

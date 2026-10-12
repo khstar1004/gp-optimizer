@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "types": ["vite/client", "node"]
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "server/**/*.ts",
+    "server/**/*.cts",
+    "server.cts",
+    "scripts/**/*.mts",
+    "test/**/*.ts",
+    "test/**/*.cts",
+    "data/**/*.mts",
+    "js/vendor/kairos/**/*.ts",
+    "js/vendor/vista/**/*.ts",
+    "js/vendor/warground/**/*.ts",
+    "types/**/*.d.ts",
+    "vite.config.mts"
+  ]
+}

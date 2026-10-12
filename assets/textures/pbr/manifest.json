@@ -1,0 +1,50 @@
+[
+  {
+    "slug": "concrete",
+    "usage": "backs tex_concrete()",
+    "source": "polyhaven.com",
+    "license": "CC0",
+    "resolution": "1k",
+    "fetchedAt": "2026-09-07T05:03:33.896Z"
+  },
+  {
+    "slug": "corrugated_iron",
+    "usage": "backs tex_roofmetal()",
+    "source": "polyhaven.com",
+    "license": "CC0",
+    "resolution": "1k",
+    "fetchedAt": "2026-09-07T05:03:35.098Z"
+  },
+  {
+    "slug": "painted_plaster_wall",
+    "usage": "backs tex_panel() (retinted per building)",
+    "source": "polyhaven.com",
+    "license": "CC0",
+    "resolution": "1k",
+    "fetchedAt": "2026-09-07T05:03:35.893Z"
+  },
+  {
+    "slug": "red_brick",
+    "usage": "backs tex_brick() (luminance-only detail layer)",
+    "source": "polyhaven.com",
+    "license": "CC0",
+    "resolution": "1k",
+    "fetchedAt": "2026-09-07T05:03:36.698Z"
+  },
+  {
+    "slug": "forest_leaves_02",
+    "usage": "backs GP terrain near-camera detail blend (data/blender_cache/detail_bake_v4.py) — forest-floor/canopy-shadow areas",
+    "source": "polyhaven.com",
+    "license": "CC0",
+    "resolution": "2k",
+    "fetchedAt": "2026-09-07T15:10:00.000Z"
+  },
+  {
+    "slug": "brown_mud_leaves_01",
+    "usage": "backs GP terrain near-camera detail blend (data/blender_cache/detail_bake_v4.py) — open/bare-soil areas",
+    "source": "polyhaven.com",
+    "license": "CC0",
+    "resolution": "2k",
+    "fetchedAt": "2026-09-07T15:10:00.000Z"
+  }
+]
